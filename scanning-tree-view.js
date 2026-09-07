@@ -66,6 +66,37 @@
  *    The poll only touches the screen when something actually
  *    changed, so it doesn't cause visible flicker.
  *
+ * 3) Warehouse Notes panel
+ *    The job's "Warehouse Notes" custom field (Settings > Custom
+ *    fields > Job > Warehouse Notes, field name "warehouse_notes") is
+ *    shown so warehouse staff can see it without leaving the scanning
+ *    screen. It's fetched by requesting the job's own page
+ *    (/job.php?id=<job>) with the browser's existing session cookie
+ *    and picking the value out of the "job_data" object HireHop
+ *    embeds in that page - there's no dedicated JSON endpoint for
+ *    this, so we parse it out of the HTML. Read-only: this doesn't
+ *    let you edit the note from the scanning screen, only see it.
+ *    Only shown for job-level scans (Prep job / Check job out), and
+ *    only when the note isn't empty - if there's nothing to say,
+ *    nothing takes up any extra space, same as before this feature
+ *    existed.
+ *
+ *    Shown in one of two places depending on screen width, so it's
+ *    visible either way rather than only on desktop:
+ *      - Wide screens (>675px, the same breakpoint HireHop's own
+ *        scanning.js uses to decide whether Categories/Log/Boxes fit
+ *        on screen): a small panel above that accordion, which
+ *        shrinks to make room for it.
+ *      - Narrow/mobile screens (<=675px): HireHop already hides that
+ *        whole left-hand column by default there and gives the grid
+ *        the full width, so instead the note shows as a banner above
+ *        the grid itself, where it can't be missed without an extra
+ *        tap. left_pane and grid_pane both get shrunk vertically to
+ *        make room for it.
+ *    Which one is actually visible is decided purely by CSS media
+ *    queries, so it stays correct across window resizes/rotation
+ *    without any extra JS listeners.
+ *
  * Verified against HireHop's own scanning.js (pqgrid.min.js v11.2.1b)
  * on a live scanning screen in September 2026. If HireHop changes the
  * internals of the scanning module, this may need updating.
@@ -77,6 +108,17 @@
   // that should default to Tree view. Add/remove values here if you
   // want this to apply to other modes too, e.g. 3 = "Check job in".
   var TREE_DEFAULT_KINDS = [1, 2]; // 1 = Prep job, 2 = Check job out
+
+  // Scan "kind" values that should show the Warehouse Notes panel.
+  // Job-level scans only - "main_id" is a job id for these, which is
+  // what the panel needs to look up the note. Project-level kinds
+  // (20-23) aren't included since main_id there is a project id, not
+  // a job id.
+  var WAREHOUSE_NOTES_KINDS = [1, 2]; // 1 = Prep job, 2 = Check job out
+
+  // Field name of the custom field to show, as set up in Settings >
+  // Custom fields > Job.
+  var WAREHOUSE_NOTES_FIELD = 'warehouse_notes';
 
   // How often (ms) to re-check that the tree view matches the live
   // scan data, as a safety net for updates that bypass our hooks.
@@ -115,7 +157,6 @@
     }
     return kept;
   }
-
   // Cheap fingerprint of which nodes are currently kept, so the poll
   // (and the hooked methods) can tell whether the screen needs to be
   // re-rendered rather than doing it unconditionally every tick.
@@ -151,6 +192,218 @@
     }
   }
 
+  // Pulls the "job_data" JS object out of a fetched /job.php page. It's
+  // embedded as a plain (non-JSON-string) assignment, e.g.
+  // "...,job_id=2944,job_data={...},..." - so we find the "{" after
+  // "job_data=" and walk forward counting brace depth (skipping over
+  // braces inside quoted strings) until it balances back to zero, then
+  // JSON.parse just that slice.
+  function extractJobData(html) {
+    var marker = 'job_data=';
+    var markerIdx = html.indexOf(marker);
+    if (markerIdx === -1) return null;
+    var start = html.indexOf('{', markerIdx);
+    if (start === -1) return null;
+    var i = start, depth = 0, inStr = false, strChar = '', esc = false;
+    for (; i < html.length; i++) {
+      var ch = html[i];
+      if (inStr) {
+        if (esc) esc = false;
+        else if (ch === '\\') esc = true;
+        else if (ch === strChar) inStr = false;
+      } else {
+        if (ch === '"' || ch === "'") { inStr = true; strChar = ch; }
+        else if (ch === '{') depth++;
+        else if (ch === '}') { depth--; if (depth === 0) { i++; break; } }
+      }
+    }
+    try {
+      return JSON.parse(html.slice(start, i));
+    } catch (e) {
+      return null;
+    }
+  }
+
+  // Fetches the warehouse note text for a job id, using the browser's
+  // existing session cookie (same-origin request - no API token
+  // needed, same way the scanning screen's own get_*.php calls work).
+  function fetchWarehouseNote(jobId) {
+    return fetch('/job.php?id=' + encodeURIComponent(jobId), { credentials: 'same-origin' })
+      .then(function (res) { return res.text(); })
+      .then(function (html) {
+        var jobData = extractJobData(html);
+        var field = jobData && jobData.CUSTOM_FIELDS && jobData.CUSTOM_FIELDS[WAREHOUSE_NOTES_FIELD];
+        return (field && field.value) ? String(field.value) : '';
+      })
+      .catch(function (e) {
+        console.warn('[scanning-tree-view plugin] could not load warehouse notes', e);
+        return '';
+      });
+  }
+  // Breakpoint below which HireHop itself hides left_pane and gives
+  // the grid the full screen width (see scanning.js's own resize()).
+  // We reuse the same number so our layout switches at exactly the
+  // same point HireHop's own does.
+  var MOBILE_BREAKPOINT_PX = 675;
+
+  // Injected once: which of the two note elements (see below) is
+  // actually visible is driven by these media queries rather than JS,
+  // so it responds to window resizes/orientation changes for free.
+  // Both elements still get shown/hidden together based on whether
+  // there's a note at all - this only decides which ONE of the two
+  // is used to display it at the current width.
+  function ensureNotesStyles() {
+    if (document.getElementById('wh_notes_plugin_style')) return;
+    $('<style>', {
+      id: 'wh_notes_plugin_style',
+      text:
+        '@media (max-width:' + MOBILE_BREAKPOINT_PX + 'px){' +
+        '.wh_notes_panel{display:none !important;}' +
+        '}' +
+        '@media (min-width:' + (MOBILE_BREAKPOINT_PX + 1) + 'px){' +
+        '.wh_notes_banner{display:none !important;}' +
+        '}'
+    }).appendTo('head');
+  }
+
+  // Desktop/tablet: a small panel prepended above the Categories/Log/
+  // Boxes accordion inside left_pane (this is what shrinks that
+  // accordion to make room, per adjustLeftPaneLayout below).
+  function ensureNotesPanel(instance) {
+    if (instance.__wh_notes_panel) return instance.__wh_notes_panel;
+    ensureNotesStyles();
+    var panel = $('<div>', { class: 'wh_notes_panel' })
+      .css({
+        display: 'none',
+        margin: '0 0 6px 0',
+        padding: '6px 8px',
+        background: '#fff8dd',
+        border: '1px solid #e0c975',
+        borderRadius: '4px',
+        fontSize: '12px',
+        lineHeight: '1.4',
+        boxSizing: 'border-box',
+        wordBreak: 'break-word'
+      })
+      .prependTo(instance.left_pane);
+    $('<div>', { text: 'Warehouse Notes' })
+      .css({ fontWeight: 'bold', marginBottom: '3px', color: '#8a6d1a' })
+      .appendTo(panel);
+    $('<div>', { class: 'wh_notes_panel_body' }).appendTo(panel);
+    instance.__wh_notes_panel = panel;
+    return panel;
+  }
+
+  // Mobile: HireHop hides left_pane below the breakpoint and gives
+  // the grid the full screen, so the desktop panel above would never
+  // be seen without an extra tap. Instead, on narrow screens, show
+  // the same note as a full-width banner above the grid - inserted as
+  // a sibling of left_pane/grid_pane (scan_scroller is a 2-column CSS
+  // grid; grid-column spans both so it lands on its own row, pushing
+  // left_pane/grid_pane down rather than overlapping them).
+  function ensureNotesBanner(instance) {
+    if (instance.__wh_notes_banner) return instance.__wh_notes_banner;
+    ensureNotesStyles();
+    var banner = $('<div>', { class: 'wh_notes_banner' })
+      .css({
+        display: 'none',
+        gridColumn: '1 / -1',
+        minWidth: 0,
+        margin: '0 0 6px 0',
+        padding: '6px 8px',
+        background: '#fff8dd',
+        border: '1px solid #e0c975',
+        borderRadius: '4px',
+        fontSize: '12px',
+        lineHeight: '1.4',
+        boxSizing: 'border-box',
+        wordBreak: 'break-word'
+      })
+      .insertBefore(instance.left_pane);
+    $('<div>', { text: 'Warehouse Notes' })
+      .css({ fontWeight: 'bold', marginBottom: '3px', color: '#8a6d1a' })
+      .appendTo(banner);
+    $('<div>', { class: 'wh_notes_banner_body' }).appendTo(banner);
+    instance.__wh_notes_banner = banner;
+    return banner;
+  }
+  // Recomputes the accordion's (and its panels') height from
+  // left_pane's CURRENT innerHeight, same formula HireHop's own
+  // resize_left_pane uses, minus the desktop notes panel's height if
+  // it's the one currently showing. Called after left_pane's own
+  // outer height is finalised (see adjustLeftPaneLayout), so this
+  // always reflects any shrink already applied for the mobile banner
+  // too, whether or not that's the branch actually in play.
+  function recomputeAccordionHeight(instance) {
+    if (!instance.accordion || !instance.left_pane_buttons) return;
+    var base = instance.left_pane.innerHeight() - instance.left_pane_buttons.outerHeight() - 2;
+    var panel = instance.__wh_notes_panel;
+    if (panel && panel.length && panel.is(':visible')) {
+      base -= (panel.outerHeight(true) || 0);
+    }
+    if (base < 40) base = 40;
+    instance.accordion.height(base);
+    var panelHeight = instance.accordion.innerHeight() - instance.accordion.find('h3').length * 40;
+    instance.accordion.find('div.accordion_panel').height(panelHeight);
+  }
+
+  // If the mobile banner is the one currently showing, it's sitting
+  // above left_pane/grid_pane as an extra row, so both need to shrink
+  // by its height or the bottom of the grid runs past the visible
+  // area (HireHop sizes both with fixed pixel heights, so this has to
+  // be done explicitly - CSS grid alone won't reflow that for us).
+  function shrinkForMobileBanner(instance) {
+    var banner = instance.__wh_notes_banner;
+    if (!banner || !banner.length || !banner.is(':visible')) return;
+    var extra = banner.outerHeight(true) || 0;
+    if (!extra) return;
+    var newHeight = Math.max(instance.left_pane.height() - extra, 200);
+    instance.left_pane.height(newHeight);
+    if (instance.grid_pane) instance.grid_pane.height(newHeight);
+  }
+
+  // Runs after every resize_left_pane call (HireHop's own, which
+  // always resets left_pane's height to the full - notes-unaware -
+  // value first). Order matters: shrink left_pane's outer height for
+  // the mobile banner first, then recompute the accordion from
+  // whatever's left, so the two adjustments compose correctly however
+  // both are visible.
+  function adjustLeftPaneLayout(instance) {
+    shrinkForMobileBanner(instance);
+    recomputeAccordionHeight(instance);
+  }
+
+  // Loads and displays (or hides) the warehouse notes panel/banner
+  // for whatever job is currently on screen. Skips the fetch if we
+  // already loaded this job's note (tracked via __wh_notes_main_id),
+  // and bails out cleanly if the user has switched jobs again before
+  // a slow fetch comes back.
+  function applyWarehouseNote(instance, kind, mainId) {
+    if (!instance.left_pane) return;
+    if (WAREHOUSE_NOTES_KINDS.indexOf(kind) === -1) {
+      if (instance.__wh_notes_panel) instance.__wh_notes_panel.hide();
+      if (instance.__wh_notes_banner) instance.__wh_notes_banner.hide();
+      return;
+    }
+    if (instance.__wh_notes_main_id === mainId && instance.__wh_notes_panel) return;
+    instance.__wh_notes_main_id = mainId;
+    fetchWarehouseNote(mainId).then(function (note) {
+      if (instance.__wh_notes_main_id !== mainId) return; // job changed again meanwhile
+      var panel = ensureNotesPanel(instance);
+      var banner = ensureNotesBanner(instance);
+      if (note) {
+        panel.find('.wh_notes_panel_body').text(note);
+        banner.find('.wh_notes_banner_body').text(note);
+        panel.show();
+        banner.show();
+      } else {
+        panel.hide();
+        banner.hide();
+      }
+      if (instance.resize_left_pane) instance.resize_left_pane();
+    });
+  }
+
   function defaultToTreeIfApplicable(instance) {
     try {
       if (
@@ -163,7 +416,6 @@
       console.warn('[scanning-tree-view plugin] could not default to Tree view', e);
     }
   }
-
   // Patches a live scanning_app widget instance in place. Safe to
   // call repeatedly - it only patches an instance once.
   function patchInstance(instance) {
@@ -175,6 +427,7 @@
       var result = origInitialDataLoaded.apply(this, arguments);
       defaultToTreeIfApplicable(this);
       applyTreeHideCompleted(this);
+      applyWarehouseNote(this, this.options.kind, this.options.main_id);
       return result;
     };
 
@@ -192,12 +445,26 @@
       return result;
     };
 
+    // Wrap resize_left_pane so that whenever HireHop (re)computes the
+    // Categories/Log/Boxes accordion's height - window resize, panel
+    // toggled open, etc. - we get a chance to shrink it further to
+    // make room for the notes panel, if it's showing.
+    if (instance.resize_left_pane) {
+      var origResizeLeftPane = instance.resize_left_pane;
+      instance.resize_left_pane = function () {
+        var result = origResizeLeftPane.apply(this, arguments);
+        adjustLeftPaneLayout(this);
+        return result;
+      };
+    }
+
     // This plugin may have loaded after the page already created and
     // populated this instance (initial_data_loaded already fired once
     // before we could wrap it), so replay the effect now for whatever
     // state the screen is already in.
     defaultToTreeIfApplicable(instance);
     applyTreeHideCompleted(instance);
+    applyWarehouseNote(instance, instance.options.kind, instance.options.main_id);
 
     // Safety net: some updates (deleting/undoing a scan, another
     // terminal's changes arriving over HireHop's real-time sync) turn
