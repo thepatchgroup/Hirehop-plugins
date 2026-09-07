@@ -10,9 +10,11 @@
  *
  *   https://cdn.jsdelivr.net/gh/YOUR-USERNAME/YOUR-REPO@main/scanning-tree-view.js
  *
- * jsDelivr caches files for a while, so after editing this file on
- * GitHub, force it to pick up the change immediately by opening:
- *   https://purge.jsdelivr.net/gh/YOUR-USERNAME/YOUR-REPO@main/scanning-tree-view.js
+ * jsDelivr's @main alias can lag behind GitHub for a while even after
+ * calling the purge endpoint. If you need a change to show up
+ * immediately, use a commit-pinned URL instead (content never changes
+ * for a given commit, so there's no staleness question):
+ *   https://cdn.jsdelivr.net/gh/YOUR-USERNAME/YOUR-REPO@<commit-sha>/scanning-tree-view.js
  *
  * How it works
  * ------------
@@ -22,11 +24,10 @@
  * class before it's used (HireHop's own customisation guide describes
  * that pattern, but it only works if your plugin script runs before
  * the page creates its own instance of the widget - on the scanning
- * page it doesn't: the page creates its instance right away, before
- * there's a reliable moment to hook in first), this patches the
- * *specific instance* already running on the page directly. That
- * works no matter when our script happens to load relative to
- * HireHop's own scripts.
+ * page it doesn't: the page creates its instance right away), this
+ * patches the *specific instance* already running on the page
+ * directly. That works no matter when our script happens to load
+ * relative to HireHop's own scripts.
  *
  * We poll for the scanning widget's instance and, once found, replace
  * three of its methods on that instance with wrapped versions that
@@ -52,9 +53,18 @@
  *    of its children too). A node is only removed once the WHOLE
  *    unit (the item and everything nested under it) is done, so a
  *    kit/parent with some accessories still outstanding stays
- *    visible. This re-runs after every scan and whenever the checkbox
- *    is toggled, so items disappear live as they're completed - not
- *    just on reload.
+ *    visible.
+ *
+ *    This re-runs after every scan and whenever the checkbox is
+ *    toggled (instant). It ALSO re-runs on a short poll (every ~1.5s)
+ *    that compares the current live scan data against what's on
+ *    screen and re-syncs if they've drifted - this is a safety net
+ *    for updates that don't go through the methods we hook, e.g.
+ *    deleting/undoing a scan, or another terminal's changes arriving
+ *    over HireHop's real-time sync, both of which we found can update
+ *    the underlying data without going through apply_data_changes.
+ *    The poll only touches the screen when something actually
+ *    changed, so it doesn't cause visible flicker.
  *
  * Verified against HireHop's own scanning.js (pqgrid.min.js v11.2.1b)
  * on a live scanning screen in September 2026. If HireHop changes the
@@ -67,6 +77,10 @@
   // that should default to Tree view. Add/remove values here if you
   // want this to apply to other modes too, e.g. 3 = "Check job in".
   var TREE_DEFAULT_KINDS = [1, 2]; // 1 = Prep job, 2 = Check job out
+
+  // How often (ms) to re-check that the tree view matches the live
+  // scan data, as a safety net for updates that bypass our hooks.
+  var SYNC_POLL_INTERVAL_MS = 1500;
 
   // A node counts as "fully scanned" if it has no children and its
   // own remaining count is 0 or less, OR - if it does have children
@@ -102,14 +116,32 @@
     return kept;
   }
 
+  // Cheap fingerprint of which nodes are currently kept, so the poll
+  // (and the hooked methods) can tell whether the screen needs to be
+  // re-rendered rather than doing it unconditionally every tick.
+  function computeSignature(nodes) {
+    var ids = [];
+    (function walk(list) {
+      for (var i = 0; i < list.length; i++) {
+        ids.push(list[i].item_index || list[i].ID);
+        if (list[i].children) walk(list[i].children);
+      }
+    })(nodes);
+    return ids.length + ':' + ids.join(',');
+  }
+
   // Rebuilds the tree grid's data from the live scan data, either
-  // pruned (checkbox on) or as-is (checkbox off), and repaints it.
+  // pruned (checkbox on) or as-is (checkbox off), and repaints it -
+  // but only if it actually differs from what's currently shown.
   function applyTreeHideCompleted(instance) {
     if (!instance.treeGrid || !instance.hideComplete) return;
     var sourceTree = (instance.data && instance.data.tree) || [];
     var target = instance.hideComplete[0].checked
       ? pruneCompleteBranches(sourceTree)
       : sourceTree;
+    var sig = computeSignature(target);
+    if (sig === instance.__tree_hide_plugin_sig) return; // already in sync
+    instance.__tree_hide_plugin_sig = sig;
     try {
       instance.treeGrid
         .pqGrid('option', 'dataModel.data', target)
@@ -166,6 +198,15 @@
     // state the screen is already in.
     defaultToTreeIfApplicable(instance);
     applyTreeHideCompleted(instance);
+
+    // Safety net: some updates (deleting/undoing a scan, another
+    // terminal's changes arriving over HireHop's real-time sync) turn
+    // out not to go through apply_data_changes, so they'd otherwise
+    // leave the tree view stuck showing a stale, over-hidden state.
+    // Poll and self-correct if the live data has moved on without us.
+    setInterval(function () {
+      applyTreeHideCompleted(instance);
+    }, SYNC_POLL_INTERVAL_MS);
   }
 
   function findAndPatch() {
