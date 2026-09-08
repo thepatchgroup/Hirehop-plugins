@@ -296,31 +296,37 @@
 
   // Rebuilds the tree grid's data from the live scan data, either
   // pruned (checkbox on) or as-is (checkbox off), and repaints it -
-  // but only if it actually differs from what's currently shown.
-  function applyTreeHideCompleted(instance) {
+  // but only if it actually differs from what we last painted, unless
+  // force is true.
+  //
+  // We compare against instance.__tree_hide_plugin_sig - our OWN memory
+  // of what we last told pqGrid to show - rather than reading pqGrid's
+  // live dataModel.data back. We tried the latter (reasoning: it'd
+  // self-heal no matter what reset the screen) but pqGrid's live tree
+  // data model turns out not to be reliably comparable the way we were
+  // reading it, so that comparison mismatched on basically every poll
+  // tick and forced a clear+repaint every 1.5s - a constant visible
+  // flicker, worse than the bug it was meant to fix. Back to comparing
+  // our own cached signature, which only repaints when something
+  // actually needs to change.
+  //
+  // That still leaves the original problem: HireHop's own code can
+  // reset dataModel.data back to the full, unpruned list without going
+  // through any method we hook (seen right after the automatic
+  // List/Grouped/Tree tab switch on page load) - our cache doesn't
+  // notice that since OUR source data hasn't changed. Rather than
+  // detecting it generically, defaultToTreeIfApplicable calls this with
+  // force=true a couple of times shortly after it switches to the Tree
+  // tab, to directly catch and correct that specific reset.
+  function applyTreeHideCompleted(instance, force) {
     if (!instance.treeGrid || !instance.hideComplete) return;
     var sourceTree = (instance.data && instance.data.tree) || [];
     var target = instance.hideComplete[0].checked
       ? pruneCompleteBranches(sourceTree)
       : cloneTreeStripped(sourceTree);
     var sig = computeSignature(target);
-
-    // Compare against what pqGrid is ACTUALLY showing right now, not a
-    // cached memory of what we last told it to show. Earlier this kept
-    // a separate instance.__tree_hide_plugin_sig and skipped repainting
-    // once that matched - but HireHop's own code can reset
-    // dataModel.data back to the full, unpruned list without going
-    // through any method we hook (seen right after the automatic
-    // List/Grouped/Tree tab switch on page load: our code runs once,
-    // correctly, but something native resets the grid a moment later).
-    // Our cached signature had no way to notice that - it still
-    // "remembered" being correct, so the poll below kept skipping a
-    // repaint forever even though the screen had silently reverted.
-    // Reading pqGrid's own live data model instead of trusting our
-    // memory catches this: whatever reset it, we always know to
-    // repaint when the live model doesn't match what it should be.
-    var current = instance.treeGrid.pqGrid('option', 'dataModel.data') || [];
-    if (computeSignature(current) === sig) return; // screen already matches
+    if (!force && instance.__tree_hide_plugin_sig === sig) return; // already painted this
+    instance.__tree_hide_plugin_sig = sig;
 
     try {
       // A single dataModel.data set + refreshDataAndView is enough when
@@ -565,6 +571,18 @@
         TREE_DEFAULT_KINDS.indexOf(instance.options.kind) !== -1
       ) {
         instance.gridTabs.tabs('option', 'active', 2); // 2 = Tree tab
+
+        // HireHop's own handling of this tab switch can reset the tree
+        // grid's data back to the full, unpruned list a moment after
+        // this call returns - our own repaint (called right after this,
+        // in initial_data_loaded/patchInstance) runs first and is
+        // correct, then something native quietly reverts it, which is
+        // what made items need a manual untick+retick to actually stay
+        // hidden. Force a couple of extra repaints shortly afterwards
+        // to catch that - two, staggered, since we don't know exactly
+        // when the native reset lands.
+        setTimeout(function () { applyTreeHideCompleted(instance, true); }, 150);
+        setTimeout(function () { applyTreeHideCompleted(instance, true); }, 600);
       }
     } catch (e) {
       console.warn('[scanning-tree-view plugin] could not default to Tree view', e);
