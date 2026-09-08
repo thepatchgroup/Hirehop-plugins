@@ -312,6 +312,21 @@
     if (sig === instance.__tree_hide_plugin_sig) return; // already in sync
     instance.__tree_hide_plugin_sig = sig;
     try {
+      // A single dataModel.data set + refreshDataAndView is enough when
+      // it runs off a real user click (e.g. ticking the checkbox by
+      // hand), but NOT when it runs automatically - from the initial
+      // page load, a live scan coming in, or the safety-net poll below.
+      // In those cases pqGrid can silently keep showing the previous
+      // rows even though its own data model now holds the correct,
+      // pruned set (confirmed live: __tree_hide_plugin_sig already
+      // matched the correct pruned result, but the on-screen rows
+      // hadn't moved). Clearing to an empty array first forces pqGrid
+      // to fully tear down its current rows before repainting with the
+      // real target, which reliably fixes it regardless of what
+      // triggered the update.
+      instance.treeGrid
+        .pqGrid('option', 'dataModel.data', [])
+        .pqGrid('refreshDataAndView');
       instance.treeGrid
         .pqGrid('option', 'dataModel.data', target)
         .pqGrid('refreshDataAndView');
