@@ -53,7 +53,12 @@
  *    of its children too). A node is only removed once the WHOLE
  *    unit (the item and everything nested under it) is done, so a
  *    kit/parent with some accessories still outstanding stays
- *    visible.
+ *    visible. Section headings ("Mains", "Subs", "Fills", "Amps", ...)
+ *    and inline comment rows are handled specially: they have no
+ *    meaningful "remain" of their own, so rather than being judged
+ *    complete on their own shape, each heading's whole group of items
+ *    is only removed once every real item in that group is done - see
+ *    pruneCompleteBranches below for the details.
  *
  *    This re-runs after every scan and whenever the checkbox is
  *    toggled (instant). It ALSO re-runs on a short poll (every ~1.5s)
@@ -124,6 +129,22 @@
   // scan data, as a safety net for updates that bypass our hooks.
   var SYNC_POLL_INTERVAL_MS = 1500;
 
+  // Tree node TYPE values that aren't real scannable items and have no
+  // meaningful "remain" of their own (both default to remain:0 / no
+  // children, which used to make isBranchComplete treat them as
+  // trivially "complete" and prune them immediately - even while the
+  // real items they label/annotate were still outstanding):
+  //   5   = section heading ("Mains", "Subs", "Fills", "Amps", ...) -
+  //         a flat marker sitting *before* the run of item siblings it
+  //         groups, not a true parent with a children array.
+  //   100 = inline comment/note row (see HireHop's own scanning.js,
+  //         render_title_cell - it special-cases TYPE 100).
+  var HEADING_TYPE = 5;
+  var COMMENT_TYPE = 100;
+
+  function isHeadingNode(node) { return node.TYPE === HEADING_TYPE; }
+  function isCommentNode(node) { return node.TYPE === COMMENT_TYPE; }
+
   // A node counts as "fully scanned" if it has no children and its
   // own remaining count is 0 or less, OR - if it does have children
   // (e.g. a kit, or an item with accessories nested under it) - every
@@ -138,25 +159,132 @@
     return (node.remain || 0) <= 0;
   }
 
+  // pqGrid stamps its own bookkeeping fields (pq_ri, pq_level, pq_hidden,
+  // pq_render, pq_ht, parentId, ...) directly onto each row object the
+  // first time it renders the tree - these encode row *position* (pq_ri
+  // is effectively "this was row N of the original, un-pruned list").
+  // If we feed a shallow-copied, pruned array back in while those fields
+  // are still attached, pqGrid treats the still-present rows as
+  // unchanged (same pq_ri as before) and never notices anything was
+  // removed, so refreshDataAndView silently does nothing - the exact bug
+  // that let fully-scanned items (and complete kits, e.g. a whole "Mixed
+  // Cart" once every item inside it is done) stay on screen instead of
+  // disappearing. Stripping these fields forces pqGrid to treat every
+  // node as fresh and rebuild its row indices from scratch.
+  function stripPqGridFields(node) {
+    var copy = {};
+    for (var key in node) {
+      if (node.hasOwnProperty(key) && key !== 'children' && key !== 'parentId' && key.indexOf('pq_') !== 0) {
+        copy[key] = node[key];
+      }
+    }
+    return copy;
+  }
+
+  // Full, unpruned clone of a flat sibling list (top-level tree or any
+  // node's .children), with pqGrid's bookkeeping fields stripped from
+  // every node - used for the "show everything" (checkbox unticked)
+  // state. Feeding pqGrid the *live* sourceTree object references
+  // directly caused two problems: it let pqGrid stamp its pq_* fields
+  // straight onto the plugin's own copy of the live scan data, and once
+  // stamped, toggling the checkbox back and forth fed pqGrid those same
+  // objects carrying stale pq_ri values left over from an earlier
+  // render at a different row count (e.g. the pruned view) - which was
+  // confusing pqGrid's diffing badly enough to hide every row instead
+  // of restoring them, rather than just failing to remove rows like the
+  // pruned-view bug above. Cloning + stripping here the same way
+  // pruneCompleteBranches already does means every checkbox toggle
+  // always hands pqGrid fully fresh objects and forces a clean rebuild
+  // either way.
+  function cloneTreeStripped(nodes) {
+    var out = [];
+    for (var i = 0; i < nodes.length; i++) {
+      var copy = stripPqGridFields(nodes[i]);
+      if (nodes[i].children && nodes[i].children.length) {
+        copy.children = cloneTreeStripped(nodes[i].children);
+      }
+      out.push(copy);
+    }
+    return out;
+  }
+
+  // True if every "real" item in this flat sibling list is itself
+  // fully complete - headings and comments don't count either way, so
+  // a segment made up of only a heading/comments with no real items at
+  // all reads as complete (nothing left to show there).
+  function segmentIsComplete(list) {
+    for (var i = 0; i < list.length; i++) {
+      var n = list[i];
+      if (isHeadingNode(n) || isCommentNode(n)) continue;
+      if (!isBranchComplete(n)) return false;
+    }
+    return true;
+  }
+
+  // Appends the pruned contents of one segment (a heading's group, or
+  // the leading run of nodes before any heading) onto `kept`. Comments
+  // always ride along untouched; real items are removed individually
+  // once complete, recursing into their own children exactly as
+  // before, so items keep disappearing one at a time as they're
+  // scanned even while the segment as a whole stays open.
+  function appendPrunedSegment(kept, segment) {
+    for (var i = 0; i < segment.length; i++) {
+      var node = segment[i];
+      if (isCommentNode(node)) {
+        kept.push(stripPqGridFields(node));
+        continue;
+      }
+      if (isBranchComplete(node)) continue;
+      var copy = stripPqGridFields(node);
+      if (node.children && node.children.length) {
+        copy.children = pruneCompleteBranches(node.children);
+      }
+      kept.push(copy);
+    }
+  }
+
   // Returns a copy of the node list with any fully-complete subtree
   // removed. Nodes that aren't fully complete are kept, but we still
   // recurse into their children so a completed sub-branch (e.g. one
   // fully-scanned accessory group nested a couple of levels down) can
   // disappear on its own even while its parent still has other
   // outstanding items.
+  //
+  // Headings and inline comments are handled separately from ordinary
+  // items: rather than being judged complete/incomplete on their own
+  // (which used to hide them immediately, regardless of the real items
+  // around them), each heading opens a "segment" running up to the
+  // next heading (any comments/items before the first heading form
+  // their own leading segment) - a segment, heading and all, is only
+  // dropped once every real item inside it is complete.
   function pruneCompleteBranches(nodes) {
     var kept = [];
-    for (var i = 0; i < nodes.length; i++) {
-      var node = nodes[i];
-      if (isBranchComplete(node)) continue;
-      var copy = $.extend({}, node);
-      if (node.children && node.children.length) {
-        copy.children = pruneCompleteBranches(node.children);
+    var i = 0;
+    while (i < nodes.length) {
+      if (isHeadingNode(nodes[i])) {
+        var heading = nodes[i];
+        var j = i + 1;
+        while (j < nodes.length && !isHeadingNode(nodes[j])) j++;
+        var group = nodes.slice(i + 1, j);
+        if (!segmentIsComplete(group)) {
+          kept.push(stripPqGridFields(heading));
+          appendPrunedSegment(kept, group);
+        }
+        i = j;
+        continue;
       }
-      kept.push(copy);
+
+      var k = i;
+      while (k < nodes.length && !isHeadingNode(nodes[k])) k++;
+      var leading = nodes.slice(i, k);
+      if (!segmentIsComplete(leading)) {
+        appendPrunedSegment(kept, leading);
+      }
+      i = k;
     }
     return kept;
   }
+
   // Cheap fingerprint of which nodes are currently kept, so the poll
   // (and the hooked methods) can tell whether the screen needs to be
   // re-rendered rather than doing it unconditionally every tick.
@@ -179,7 +307,7 @@
     var sourceTree = (instance.data && instance.data.tree) || [];
     var target = instance.hideComplete[0].checked
       ? pruneCompleteBranches(sourceTree)
-      : sourceTree;
+      : cloneTreeStripped(sourceTree);
     var sig = computeSignature(target);
     if (sig === instance.__tree_hide_plugin_sig) return; // already in sync
     instance.__tree_hide_plugin_sig = sig;
@@ -240,6 +368,7 @@
         return '';
       });
   }
+
   // Breakpoint below which HireHop itself hides left_pane and gives
   // the grid the full screen width (see scanning.js's own resize()).
   // We reuse the same number so our layout switches at exactly the
@@ -327,6 +456,7 @@
     instance.__wh_notes_banner = banner;
     return banner;
   }
+
   // Recomputes the accordion's (and its panels') height from
   // left_pane's CURRENT innerHeight, same formula HireHop's own
   // resize_left_pane uses, minus the desktop notes panel's height if
@@ -416,6 +546,7 @@
       console.warn('[scanning-tree-view plugin] could not default to Tree view', e);
     }
   }
+
   // Patches a live scanning_app widget instance in place. Safe to
   // call repeatedly - it only patches an instance once.
   function patchInstance(instance) {
