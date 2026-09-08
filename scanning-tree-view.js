@@ -53,12 +53,7 @@
  *    of its children too). A node is only removed once the WHOLE
  *    unit (the item and everything nested under it) is done, so a
  *    kit/parent with some accessories still outstanding stays
- *    visible. Section headings ("Mains", "Subs", "Fills", "Amps", ...)
- *    and inline comment rows are handled specially: they have no
- *    meaningful "remain" of their own, so rather than being judged
- *    complete on their own shape, each heading's whole group of items
- *    is only removed once every real item in that group is done - see
- *    pruneCompleteBranches below for the details.
+ *    visible.
  *
  *    This re-runs after every scan and whenever the checkbox is
  *    toggled (instant). It ALSO re-runs on a short poll (every ~1.5s)
@@ -309,8 +304,24 @@
       ? pruneCompleteBranches(sourceTree)
       : cloneTreeStripped(sourceTree);
     var sig = computeSignature(target);
-    if (sig === instance.__tree_hide_plugin_sig) return; // already in sync
-    instance.__tree_hide_plugin_sig = sig;
+
+    // Compare against what pqGrid is ACTUALLY showing right now, not a
+    // cached memory of what we last told it to show. Earlier this kept
+    // a separate instance.__tree_hide_plugin_sig and skipped repainting
+    // once that matched - but HireHop's own code can reset
+    // dataModel.data back to the full, unpruned list without going
+    // through any method we hook (seen right after the automatic
+    // List/Grouped/Tree tab switch on page load: our code runs once,
+    // correctly, but something native resets the grid a moment later).
+    // Our cached signature had no way to notice that - it still
+    // "remembered" being correct, so the poll below kept skipping a
+    // repaint forever even though the screen had silently reverted.
+    // Reading pqGrid's own live data model instead of trusting our
+    // memory catches this: whatever reset it, we always know to
+    // repaint when the live model doesn't match what it should be.
+    var current = instance.treeGrid.pqGrid('option', 'dataModel.data') || [];
+    if (computeSignature(current) === sig) return; // screen already matches
+
     try {
       // A single dataModel.data set + refreshDataAndView is enough when
       // it runs off a real user click (e.g. ticking the checkbox by
@@ -318,10 +329,8 @@
       // page load, a live scan coming in, or the safety-net poll below.
       // In those cases pqGrid can silently keep showing the previous
       // rows even though its own data model now holds the correct,
-      // pruned set (confirmed live: __tree_hide_plugin_sig already
-      // matched the correct pruned result, but the on-screen rows
-      // hadn't moved). Clearing to an empty array first forces pqGrid
-      // to fully tear down its current rows before repainting with the
+      // pruned set. Clearing to an empty array first forces pqGrid to
+      // fully tear down its current rows before repainting with the
       // real target, which reliably fixes it regardless of what
       // triggered the update.
       instance.treeGrid
