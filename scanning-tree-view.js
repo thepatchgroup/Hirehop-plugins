@@ -97,12 +97,63 @@
  *    queries, so it stays correct across window resizes/rotation
  *    without any extra JS listeners.
  *
+ * 4) Item memos shown inline
+ *    HireHop's own List/Grouped/Tree grids already render a small
+ *    file-text icon next to any item that has a memo set, with the memo
+ *    text sitting in that icon's `title` attribute (a native browser
+ *    tooltip on hover - no popup/dialog). That's easy to miss scanning
+ *    down a list, so we find these icons and add the memo text as a
+ *    small visible pill right next to the icon (icon is left in place,
+ *    not removed). Runs as a lightweight DOM poll across the whole
+ *    scanning app (not tied to the Tree grid specifically), since
+ *    List/Grouped/Tree keep their own separate row markup and rows get
+ *    rebuilt - losing our annotation - on every view switch/refresh.
+ *
  * Verified against HireHop's own scanning.js (pqgrid.min.js v11.2.1b)
  * on a live scanning screen in September 2026. If HireHop changes the
  * internals of the scanning module, this may need updating.
  */
 (function ($) {
   'use strict';
+
+  // Icon HireHop renders next to an item that has a memo set; the memo
+  // text itself is the icon's `title` attribute (shown natively only as
+  // a hover tooltip). Selector is scoped to elements that still carry a
+  // title, since a bare `.ui-icon-file-text` with no title isn't a memo
+  // icon at all (defensive - not seen in practice, but cheap to check).
+  var MEMO_ICON_SELECTOR = '.ui-icon-file-text[title]';
+  var MEMO_ANNOTATED_CLASS = 'wh_memo_annotated';
+  var MEMO_POLL_INTERVAL_MS = 500;
+
+  // Finds memo icons not yet annotated (anywhere under the scanning app -
+  // covers List/Grouped/Tree, all three of which render their own memo
+  // icons this same way) and adds the memo text next to each as a small
+  // visible pill, matching the styling used for the Warehouse Notes pill
+  // elsewhere in this plugin/the warehouse-notes-prep-colour.js plugin.
+  // Marking each icon as annotated (rather than tracking rows/ids) means
+  // a rebuilt row - which HireHop produces as a fresh icon element with
+  // no wh_memo_annotated class - is naturally picked up again next poll,
+  // with no separate cleanup needed for stale annotations.
+  function annotateMemoIcons() {
+    var icons = document.querySelectorAll('.hh_scanning_app ' + MEMO_ICON_SELECTOR);
+    for (var i = 0; i < icons.length; i++) {
+      var icon = icons[i];
+      if (icon.classList.contains(MEMO_ANNOTATED_CLASS)) continue;
+      icon.classList.add(MEMO_ANNOTATED_CLASS);
+      var text = icon.getAttribute('title');
+      if (!text) continue;
+      $('<span>', {
+        'class': 'wh_memo_inline',
+        title: text,
+        text: text,
+        style:
+          'display:inline-block; max-width:220px; overflow:hidden; text-overflow:ellipsis;' +
+          'vertical-align:middle; margin-left:4px; padding:0 4px; font-size:0.85em;' +
+          'font-style:italic; color:#8a6d1a; background:#fff8dd; border:1px solid #e0c975;' +
+          'border-radius:3px; white-space:nowrap;'
+      }).insertAfter(icon);
+    }
+  }
 
   // Scan "kind" values (from the mode dropdown on the scanning screen)
   // that should default to Tree view. Add/remove values here if you
@@ -664,4 +715,11 @@
   // instance later, e.g. navigating to a different scan screen).
   findAndPatch();
   setInterval(findAndPatch, 500);
+
+  // Independent of the above: doesn't need the widget instance at all,
+  // just walks the DOM for memo icons. Runs on its own poll (same
+  // interval, but deliberately not merged into findAndPatch above -
+  // that one bails out early whenever no instance is found yet, and we
+  // don't want this waiting on that).
+  setInterval(annotateMemoIcons, MEMO_POLL_INTERVAL_MS);
 })(jQuery);
