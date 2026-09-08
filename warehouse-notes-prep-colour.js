@@ -13,10 +13,10 @@
     picked automatically from the stripe colour's luminance, so it stays
     legible on every option configured on this account's Custom Fields
     screen (NONE, Red, Pink, Yellow, Grey, Brown, Green, Blue, Orange,
-    Purple, Cyan) and on any colour added later. A faint tint of the same
-    colour washes the rest of the card so it reads at a glance down the
-    list, not just from the stripe itself. Skipped entirely when the field
-    is blank or "#FFFFFF" (the field's "NONE" option) — no stripe, no tint.
+    Purple, Cyan) and on any colour added later. Only the stripe itself is
+    coloured — the rest of the card keeps its normal background. Skipped
+    entirely when the field is blank or "#FFFFFF" (the field's "NONE"
+    option) — no stripe.
 
  2) The job's "Warehouse Notes" custom field (field name: warehouse_notes),
     shown directly on the tile as a small single-line note pill (no click
@@ -68,14 +68,6 @@
   var POLL_INTERVAL_MS = 400;
   var POLL_TIMEOUT_MS = 30000;
 
-  function hexToRgba(hex, alpha) {
-    hex = String(hex).replace('#', '');
-    var r = parseInt(hex.substring(0, 2), 16);
-    var g = parseInt(hex.substring(2, 4), 16);
-    var b = parseInt(hex.substring(4, 6), 16);
-    return 'rgba(' + r + ',' + g + ',' + b + ',' + alpha + ')';
-  }
-
   // Simple perceived-brightness heuristic (ITU-R BT.601), good enough to
   // choose readable label text against any of the configured swatch colours.
   function pickTextColor(hex) {
@@ -93,7 +85,10 @@
 
   function addPrepColourStripe(div, hex) {
     if (div.find('.wh_prep_stripe').length) return; // already added
-    div.css({ display: 'flex', 'align-items': 'stretch', background: hexToRgba(hex, 0.07) });
+    // Only the stripe itself carries the colour - the rest of the card
+    // keeps its normal background (previously a faint tint of `hex`
+    // washed the whole tile too; removed per request).
+    div.css({ display: 'flex', 'align-items': 'stretch' });
     var stripe = $('<div>', {
       'class': 'wh_prep_stripe',
       title: 'Prep colour: ' + hex,
@@ -194,4 +189,3 @@
     }
   }, POLL_INTERVAL_MS);
 })();
-
