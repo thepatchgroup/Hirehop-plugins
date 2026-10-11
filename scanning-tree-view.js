@@ -30,7 +30,7 @@
  * relative to HireHop's own scripts.
  *
  * We poll for the scanning widget's instance and, once found, replace
- * three of its methods on that instance with wrapped versions that
+ * several of its methods on that instance with wrapped versions that
  * call the original first (so all of HireHop's own behaviour is
  * preserved) and then run our logic:
  *
@@ -97,63 +97,99 @@
  *    queries, so it stays correct across window resizes/rotation
  *    without any extra JS listeners.
  *
- * 4) Item memos shown inline
- *    HireHop's own List/Grouped/Tree grids already render a small
- *    file-text icon next to any item that has a memo set, with the memo
- *    text sitting in that icon's `title` attribute (a native browser
- *    tooltip on hover - no popup/dialog). That's easy to miss scanning
- *    down a list, so we find these icons and add the memo text as a
- *    small visible pill right next to the icon (icon is left in place,
- *    not removed). Runs as a lightweight DOM poll across the whole
- *    scanning app (not tied to the Tree grid specifically), since
- *    List/Grouped/Tree keep their own separate row markup and rows get
- *    rebuilt - losing our annotation - on every view switch/refresh.
+ *    Shrinking the Categories/Log/Boxes accordion to make room for
+ *    the panel (recomputeAccordionHeight) uses the same fixed-share
+ *    formula HireHop's own resize_left_pane does, which can give
+ *    whichever panel is actually open (most often Boxes) less height
+ *    than its own content needs - e.g. its two "Open box"/"Open new
+ *    box" buttons sitting right at the bottom. The first fix tried
+ *    here was to grow that panel to fit - but the panel's own
+ *    container (the accordion) doesn't grow to match, so a grown
+ *    panel just overflows past the accordion's box and overlaps
+ *    whatever sits below it in left_pane (the "Charge for additional
+ *    items"/"Hide completed items"/"Allow extras" checkboxes).
+ *    recomputeAccordionHeight instead gives any panel whose content
+ *    doesn't fit its own internal scrollbar: the panel's box stays
+ *    exactly the size the fixed-share formula gave it, but its full
+ *    content - those buttons included - stays reachable by scrolling
+ *    within the panel, with nothing outside it ever covered.
+ *
+ * 4) Inline notes: stock item memo / item memo / item note
+ *    Three distinct kinds of note, from two different places in
+ *    HireHop, shown inline on the scan grid's item rows (all three of
+ *    Tree/List/Grouped):
+ *      - Stock item memo - a general note set once on the equipment's
+ *        own catalogue record (e.g. "Make sure I have a threaded
+ *        insert"), the same for every job that uses that piece of
+ *        kit. HireHop shows this today only inside the "View details"
+ *        popup (double-click an item, or the toolbar's "View details"
+ *        button) - no inline indicator at all otherwise. Shown first,
+ *        in red, prefaced "Reminder:". Not part of the scan data
+ *        already loaded - fetched on demand from
+ *        /modules/scanning/get_item_info.php (the same endpoint that
+ *        popup uses; same-origin, existing session cookie, no API
+ *        token needed), once per distinct item and cached for the
+ *        rest of the session, with fetches capped to a few at a time.
+ *      - Item memo - a note typed once for this specific job's hire
+ *        line (the MEMO field). Already in the loaded scan data, and
+ *        HireHop already shows a small file-text icon for it with the
+ *        text only visible as a hover tooltip. Shown second, in
+ *        yellow, prefaced "Note:" - alongside that native icon, not
+ *        replacing it.
+ *      - Item note - this job line's own ADDITIONAL field. HireHop
+ *        already renders this natively, inline in italics right after
+ *        the item's title (its own stored text often already starts
+ *        with the word "Note:" - that's simply what whoever built the
+ *        job happened to type into the field, nothing to do with our
+ *        own labelling below). The least important of the three, so
+ *        rather than competing for attention on the item's main line
+ *        it's moved to its own smaller line directly under the item,
+ *        indented to line up under the item's own title rather than
+ *        the icons/qty that lead the line, prefaced "Quote Note:" -
+ *        the native inline copy is hidden so it isn't shown twice.
+ *    All three show their full text, wrapping onto more lines rather
+ *    than being cut off, and the stock item memo/item memo sit on the
+ *    item's own line (wrapping there too if needed) with the item
+ *    note on its own line below.
+ *
+ *    Implementation: rather than polling the DOM and bolting pills on
+ *    after the fact (the approach originally tried here - see below),
+ *    this hooks the scanning app's own render_title_cell method (the
+ *    same one HireHop's own column postRender calls to draw each
+ *    item's icons/qty/title - shared by all three views), the same
+ *    "wrap the original" pattern used for every other method this
+ *    plugin patches. That matters for the wrapping: content added
+ *    *after* HireHop's own render finishes doesn't influence the row
+ *    height pqGrid already settled on for that row, so DOM-appended
+ *    wrapped text just gets cut off by that fixed-height,
+ *    overflow:hidden cell - the exact same class of bug as the
+ *    Boxes-panel one above, and for the same underlying reason (pqGrid
+ *    positions every row below it by a fixed pixel offset, so growing
+ *    one row's box without pqGrid's knowledge just overlaps the row
+ *    after it). Hooking the render function itself means our content
+ *    is part of what gets drawn on every render, but pqGrid's row
+ *    height (`rowHt`) is a single fixed/configured value here too, not
+ *    recalculated from actual rendered content (confirmed live -
+ *    forcing a re-render after adding wrapped content left the row's
+ *    height untouched). The one thing pqGrid *does* respect is a
+ *    per-row override: setting `pq_ht` (and `pq_htfix: true`) directly
+ *    on a row's own data object and refreshing. So this is necessarily
+ *    a two-pass process - a row can't be measured until after it's
+ *    been rendered with its notes in it: render once (wrapping via
+ *    flex-wrap so the content lays out correctly even while the box is
+ *    still too short to show all of it), measure the actual height
+ *    needed, and if it didn't fit, record that height against the item
+ *    and ask for a refresh - which re-renders with the override
+ *    applied, this time at the right height, with every row below it
+ *    shifted down correctly and nothing overlapping.
  *
  * Verified against HireHop's own scanning.js (pqgrid.min.js v11.2.1b)
- * on a live scanning screen in September 2026. If HireHop changes the
- * internals of the scanning module, this may need updating.
+ * on a live scanning screen in September/October 2026. If HireHop
+ * changes the internals of the scanning module, this may need
+ * updating.
  */
 (function ($) {
   'use strict';
-
-  // Icon HireHop renders next to an item that has a memo set; the memo
-  // text itself is the icon's `title` attribute (shown natively only as
-  // a hover tooltip). Selector is scoped to elements that still carry a
-  // title, since a bare `.ui-icon-file-text` with no title isn't a memo
-  // icon at all (defensive - not seen in practice, but cheap to check).
-  var MEMO_ICON_SELECTOR = '.ui-icon-file-text[title]';
-  var MEMO_ANNOTATED_CLASS = 'wh_memo_annotated';
-  var MEMO_POLL_INTERVAL_MS = 500;
-
-  // Finds memo icons not yet annotated (anywhere under the scanning app -
-  // covers List/Grouped/Tree, all three of which render their own memo
-  // icons this same way) and adds the memo text next to each as a small
-  // visible pill, matching the styling used for the Warehouse Notes pill
-  // elsewhere in this plugin/the warehouse-notes-prep-colour.js plugin.
-  // Marking each icon as annotated (rather than tracking rows/ids) means
-  // a rebuilt row - which HireHop produces as a fresh icon element with
-  // no wh_memo_annotated class - is naturally picked up again next poll,
-  // with no separate cleanup needed for stale annotations.
-  function annotateMemoIcons() {
-    var icons = document.querySelectorAll('.hh_scanning_app ' + MEMO_ICON_SELECTOR);
-    for (var i = 0; i < icons.length; i++) {
-      var icon = icons[i];
-      if (icon.classList.contains(MEMO_ANNOTATED_CLASS)) continue;
-      icon.classList.add(MEMO_ANNOTATED_CLASS);
-      var text = icon.getAttribute('title');
-      if (!text) continue;
-      $('<span>', {
-        'class': 'wh_memo_inline',
-        title: text,
-        text: text,
-        style:
-          'display:inline-block; max-width:220px; overflow:hidden; text-overflow:ellipsis;' +
-          'vertical-align:middle; margin-left:4px; padding:0 4px; font-size:0.85em;' +
-          'font-style:italic; color:#8a6d1a; background:#fff8dd; border:1px solid #e0c975;' +
-          'border-radius:3px; white-space:nowrap;'
-      }).insertAfter(icon);
-    }
-  }
 
   // Scan "kind" values (from the mode dropdown on the scanning screen)
   // that should default to Tree view. Add/remove values here if you
@@ -216,7 +252,10 @@
   // that let fully-scanned items (and complete kits, e.g. a whole "Mixed
   // Cart" once every item inside it is done) stay on screen instead of
   // disappearing. Stripping these fields forces pqGrid to treat every
-  // node as fresh and rebuild its row indices from scratch.
+  // node as fresh and rebuild its row indices from scratch. (Row-height
+  // overrides from the inline-notes feature below are re-applied
+  // separately, after this stripping, by scheduleGridRefresh - they
+  // aren't preserved here on purpose, same as every other pq_ field.)
   function stripPqGridFields(node) {
     var copy = {};
     for (var key in node) {
@@ -403,7 +442,7 @@
 
   // Pulls the "job_data" JS object out of a fetched /job.php page. It's
   // embedded as a plain (non-JSON-string) assignment, e.g.
-  // "...,job_id=2944,job_data={...},..." - so we find the "{" after
+  // "...,job_id=2944,job_data={...},...\" - so we find the "{" after
   // "job_data=" and walk forward counting brace depth (skipping over
   // braces inside quoted strings) until it balances back to zero, then
   // JSON.parse just that slice.
@@ -556,6 +595,24 @@
     instance.accordion.height(base);
     var panelHeight = instance.accordion.innerHeight() - instance.accordion.find('h3').length * 40;
     instance.accordion.find('div.accordion_panel').height(panelHeight);
+
+    // The fixed-share height above can give a panel's own content more
+    // than it fits - most often Boxes, whose "Open box"/"Open new box"
+    // buttons sit right at the bottom, past the panel's own bottom
+    // edge once the notes panel has eaten into the space this formula
+    // had to share out. Growing the panel to fit was the first fix
+    // tried here, but that just overflows the panel past the
+    // accordion's own box and overlaps whatever sits below left_pane's
+    // accordion - the "Charge for additional items"/"Hide completed
+    // items"/"Allow extras" checkboxes, in particular. A scrollbar
+    // fixes the same problem without resizing anything: each panel's
+    // own box stays exactly the size this formula gave it, but
+    // whichever one doesn't fit gets an internal scrollbar so its full
+    // content - those buttons included - stays reachable, with nothing
+    // outside it ever covered.
+    instance.accordion.find('div.accordion_panel').each(function () {
+      this.style.overflowY = (this.scrollHeight > this.clientHeight) ? 'auto' : '';
+    });
   }
 
   // If the mobile banner is the one currently showing, it's sitting
@@ -613,6 +670,224 @@
       }
       if (instance.resize_left_pane) instance.resize_left_pane();
     });
+  }
+
+  // --- Inline notes: stock item memo / item memo / item note ---
+  // (see header comment for the full design/rationale)
+
+  var PILL_STYLE_RED =
+    'display:inline-block; max-width:360px; white-space:normal; word-break:break-word;' +
+    'vertical-align:middle; margin-left:4px; padding:1px 5px; font-size:0.85em;' +
+    'font-style:italic; color:#a81c1c; background:#fdecea; border:1px solid #f1a9a0;' +
+    'border-radius:3px;';
+  var PILL_STYLE_YELLOW =
+    'display:inline-block; max-width:360px; white-space:normal; word-break:break-word;' +
+    'vertical-align:middle; margin-left:4px; padding:1px 5px; font-size:0.85em;' +
+    'font-style:italic; color:#8a6d1a; background:#fff8dd; border:1px solid #e0c975;' +
+    'border-radius:3px;';
+  var NOTE_STYLE_SMALL =
+    'display:block; flex-basis:100%; width:100%; box-sizing:border-box; white-space:normal;' +
+    'word-break:break-word; margin-top:1px; font-size:0.78em; color:#777; font-style:italic;';
+
+  var STOCK_MEMO_MAX_CONCURRENT = 3;
+  // Keyed by "<LIST_ID>:<TYPE>" - the same two values get_item_info.php
+  // itself is keyed on. Value is the memo string once known ('' if the
+  // item genuinely has none, so we don't ask again), or `true` while a
+  // fetch for it is already in flight.
+  var stockMemoCache = {};
+  var stockMemoInFlight = 0;
+
+  function fetchStockMemo(instance, rowData) {
+    var key = rowData.LIST_ID + ':' + rowData.TYPE;
+    if (stockMemoCache.hasOwnProperty(key)) return; // already known, or already in flight
+    stockMemoCache[key] = true;
+    stockMemoInFlight++;
+    var url = '/modules/scanning/get_item_info.php' +
+      '?job_id=' + encodeURIComponent(rowData.JOB_ID) +
+      '&main_id=' + encodeURIComponent(instance.options.main_id) +
+      '&kind=' + encodeURIComponent(instance.options.kind) +
+      '&list_id=' + encodeURIComponent(rowData.LIST_ID) +
+      '&type=' + encodeURIComponent(rowData.TYPE);
+    fetch(url, { credentials: 'same-origin' })
+      .then(function (res) { return res.json(); })
+      .then(function (info) {
+        stockMemoCache[key] = (info && info.memo) ? String(info.memo) : '';
+      })
+      .catch(function (e) {
+        console.warn('[scanning-tree-view plugin] could not load stock item memo', e);
+        stockMemoCache[key] = ''; // don't retry endlessly on a persistent error
+      })
+      .then(function () {
+        stockMemoInFlight--;
+        // This item's row won't show its stock memo pill until it's
+        // re-rendered - ask for a refresh once this batch of fetches
+        // has settled (debounced below).
+        scheduleGridRefresh(instance);
+      });
+  }
+
+  // pqGrid lays out rows at a single configured height (option `rowHt`)
+  // and doesn't re-measure it from whatever a postRender hook like
+  // ours adds - confirmed live: forcing a re-render after adding
+  // wrapped content left the row's own height/overflow untouched, the
+  // same way growing the Boxes accordion panel didn't grow its
+  // container (see header comment). The one thing pqGrid *does*
+  // respect is a per-row override - `pq_ht` (+ `pq_htfix: true`) set
+  // directly on that row's own data object - which, unlike a raw DOM
+  // resize, correctly shifts every row below it down too. We can't
+  // know a row needs this until after it's been rendered with its
+  // notes in it, so it's a two-pass process: render and measure, then
+  // (only if it didn't already fit) record the real height needed and
+  // ask for a refresh.
+  var ROW_HT_DEFAULT = 26; // native single-line row height
+  var ROW_HT_PADDING = 4; // small safety margin so wrapped text isn't juuust clipped
+  var rowHeightOverrides = {}; // "<LIST_ID>:<TYPE>" -> px height needed
+  var gridRefreshTimer = null;
+
+  function recordNeededRowHeight(rowData, neededPx) {
+    var key = rowData.LIST_ID + ':' + rowData.TYPE;
+    var target = Math.ceil(neededPx) + ROW_HT_PADDING;
+    if (target <= ROW_HT_DEFAULT) return false; // fits already, nothing to override
+    if (rowHeightOverrides[key] === target) return false; // already recorded, no change
+    rowHeightOverrides[key] = target;
+    return true;
+  }
+
+  // Applies any recorded height overrides onto a (possibly nested) list
+  // of row data objects, matched by the same LIST_ID:TYPE key used to
+  // cache them - works for the tree grid's nested data and the flat
+  // list/grouped data alike.
+  function applyRowHeightOverrides(nodes) {
+    if (!nodes) return;
+    for (var i = 0; i < nodes.length; i++) {
+      var n = nodes[i];
+      var key = n.LIST_ID + ':' + n.TYPE;
+      if (rowHeightOverrides.hasOwnProperty(key)) {
+        n.pq_ht = rowHeightOverrides[key];
+        n.pq_htfix = true;
+      }
+      if (n.children) applyRowHeightOverrides(n.children);
+    }
+  }
+
+  // Debounced: coalesces several rows discovering they need more
+  // height, or several stock-memo fetches landing, in the same moment
+  // into one refresh per grid rather than one refresh each.
+  function scheduleGridRefresh(instance) {
+    if (gridRefreshTimer) return;
+    gridRefreshTimer = setTimeout(function () {
+      gridRefreshTimer = null;
+      ['treeGrid', 'listGrid', 'groupedGrid'].forEach(function (gridName) {
+        var grid = instance[gridName];
+        if (!grid) return;
+        try {
+          var data = grid.pqGrid('option', 'dataModel.data');
+          applyRowHeightOverrides(data);
+          grid.pqGrid('refreshDataAndView');
+        } catch (e) {
+          console.warn('[scanning-tree-view plugin] could not refresh ' + gridName, e);
+        }
+      });
+    }, 150);
+  }
+
+  // The item note (see below) is shown on its own line under the item,
+  // indented to line up under the item's own title rather than flush
+  // with the icons/qty that lead the line - finds the title's own
+  // plain <span> (it's the only child span with no class, no icon, no
+  // qty "N x" padding) and returns how far in from the container's
+  // left edge it starts. The container's own padding-left is
+  // subtracted back out - it already applies once to every flex child
+  // (title included) automatically, so using the raw measurement as
+  // our note's margin-left would apply that same padding a second
+  // time and overshoot the title's actual start by it.
+  function findTitleIndent(container, title) {
+    var containerPaddingLeft = parseFloat(getComputedStyle(container).paddingLeft) || 0;
+    for (var i = 0; i < container.children.length; i++) {
+      var child = container.children[i];
+      if (child.tagName === 'SPAN' && !child.className && child.textContent === title) {
+        var raw = child.getBoundingClientRect().left - container.getBoundingClientRect().left;
+        return Math.max(0, Math.round(raw - containerPaddingLeft));
+      }
+    }
+    return 0;
+  }
+
+  // Builds and inserts the three inline notes into a just-rendered
+  // title cell, in order: stock item memo (red) and item memo (yellow)
+  // on the item's own line (wrapping onto more lines there if needed),
+  // then item note (small, grey) on its own line below. Hooked onto
+  // the scanning app's own render_title_cell (see patchInstance) -
+  // runs as part of HireHop's normal render cycle, not a separate DOM
+  // poll, so it naturally re-runs (cleanly - render_title_cell rebuilds
+  // the cell's content from scratch each time, confirmed live, so this
+  // never ends up duplicating pills) on every refresh.
+  function appendInlineNotes(instance, ui) {
+    var rowData = ui.rowData;
+    if (!rowData || rowData.TYPE === HEADING_TYPE || rowData.TYPE === COMMENT_TYPE) return;
+    var cellEl = ui.cell && ui.cell.jquery ? ui.cell[0] : ui.cell;
+    if (!cellEl) return;
+
+    // The small grey gear icon HireHop renders next to every ordinary
+    // stock item - its parent is the row's actual inline content
+    // wrapper (icons/qty/title/native note), consistent across all
+    // three views.
+    var gearIcon = cellEl.querySelector('.ui-icon-gear');
+    var container = gearIcon ? gearIcon.parentElement : cellEl.querySelector('div') || cellEl;
+    if (!container) return;
+
+    // HireHop renders the ADDITIONAL field inline, in italics, right
+    // after the title - we show it as its own, smaller line below
+    // instead (see header comment), so hide the native copy rather
+    // than show it twice.
+    var nativeNote = cellEl.querySelector('.italictext');
+    if (nativeNote) nativeNote.style.display = 'none';
+
+    // Lets our note wrap onto its own line below the main content
+    // (via its flex-basis:100% in NOTE_STYLE_SMALL) instead of being
+    // squeezed onto the same single line.
+    container.style.flexWrap = 'wrap';
+
+    var key = rowData.LIST_ID + ':' + rowData.TYPE;
+    var stockMemo = stockMemoCache[key];
+    if (stockMemo === undefined) {
+      if (stockMemoInFlight < STOCK_MEMO_MAX_CONCURRENT) fetchStockMemo(instance, rowData);
+    } else if (stockMemo && stockMemo !== true) {
+      $('<span>', {
+        'class': 'wh_stock_memo_inline',
+        text: 'Reminder: ' + stockMemo,
+        style: PILL_STYLE_RED
+      }).appendTo(container);
+    }
+
+    if (rowData.MEMO) {
+      // HireHop's own file-text icon for this same field is still
+      // shown (it's a useful at-a-glance marker even once you know
+      // what it means), but its native hover tooltip duplicates the
+      // text our pill already shows at all times - drop the tooltip
+      // rather than show the same memo twice.
+      var nativeMemoIcon = cellEl.querySelector('.ui-icon-file-text[title]');
+      if (nativeMemoIcon) nativeMemoIcon.removeAttribute('title');
+
+      $('<span>', {
+        'class': 'wh_item_memo_inline',
+        text: 'Note: ' + rowData.MEMO,
+        style: PILL_STYLE_YELLOW
+      }).appendTo(container);
+    }
+
+    if (rowData.ADDITIONAL) {
+      var noteIndent = findTitleIndent(container, rowData.TITLE);
+      $('<div>', {
+        'class': 'wh_item_note_inline',
+        text: 'Quote Note: ' + rowData.ADDITIONAL,
+        style: NOTE_STYLE_SMALL + ' margin-left:' + noteIndent + 'px;'
+      }).appendTo(container);
+    }
+
+    if (recordNeededRowHeight(rowData, container.scrollHeight)) {
+      scheduleGridRefresh(instance);
+    }
   }
 
   function defaultToTreeIfApplicable(instance) {
@@ -682,6 +957,18 @@
       };
     }
 
+    // Wrap render_title_cell (shared by Tree/List/Grouped - see header
+    // comment) so our inline notes get added as part of HireHop's own
+    // render of each item row, rather than patched on afterwards.
+    if (instance.render_title_cell) {
+      var origRenderTitleCell = instance.render_title_cell;
+      instance.render_title_cell = function (ui, flag) {
+        var result = origRenderTitleCell.apply(this, arguments);
+        appendInlineNotes(this, ui);
+        return result;
+      };
+    }
+
     // This plugin may have loaded after the page already created and
     // populated this instance (initial_data_loaded already fired once
     // before we could wrap it), so replay the effect now for whatever
@@ -715,11 +1002,4 @@
   // instance later, e.g. navigating to a different scan screen).
   findAndPatch();
   setInterval(findAndPatch, 500);
-
-  // Independent of the above: doesn't need the widget instance at all,
-  // just walks the DOM for memo icons. Runs on its own poll (same
-  // interval, but deliberately not merged into findAndPatch above -
-  // that one bails out early whenever no instance is found yet, and we
-  // don't want this waiting on that).
-  setInterval(annotateMemoIcons, MEMO_POLL_INTERVAL_MS);
 })(jQuery);
