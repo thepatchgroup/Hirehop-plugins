@@ -1008,16 +1008,28 @@
   // endpoint exists). The concurrency cap alone used to be the only
   // throttle here, but these requests resolve almost instantly (small
   // JSON, same server) - without a minimum gap between dispatches too,
-  // "3 at a time" collapses into a near-continuous burst that's
-  // indistinguishable, from CloudFront's edge in front of
-  // myhirehop.com, from firing them all at once. Confirmed live: that
-  // burst is what was tripping its rate-based blocking on big jobs'
-  // Prep/Check-out screens (requests partway through the burst coming
-  // back 403, with knock-on 403s on other requests/tabs for about a
-  // minute after) - see STOCK_MEMO_STAGGER_MS and
-  // dispatchStockMemoQueue below for the actual fix.
-  var STOCK_MEMO_MAX_CONCURRENT = 2;
-  var STOCK_MEMO_STAGGER_MS = 200; // minimum gap between two dispatches starting, even with a free concurrency slot
+  // "3 at a time" collapses into a near-continuous burst.
+  //
+  // Confirmed live against HireHop's own published API docs
+  // (hirehop.co.uk/api_documentation, 12 October 2026): HireHop
+  // enforces a hard 60-requests-per-minute limit PER ACCOUNT (HTTP 429,
+  // "User error: 429 Too many requests per minute" - reproduced live),
+  // shared across EVERYTHING that account does - HireHop's own native
+  // page traffic on the same screen AND every request this plugin
+  // makes, all counted against the same budget. The docs explicitly
+  // discourage looping requests and recommend a 2-second delay per
+  // cycle if you must. An earlier version of this throttle (2
+  // concurrent, 200ms stagger - roughly 300 requests/minute at full
+  // tilt) was never going to be safe against a 60/minute account-wide
+  // ceiling shared with native traffic, regardless of CloudFront's own
+  // separate, cruder IP-level rate-based WAF rule (which a burst well
+  // beyond even that pace also tripped, confirmed live, with the whole
+  // site - not just this endpoint - 403ing for several minutes after).
+  // Paced well under the documented budget, with concurrency 1 so nothing
+  // doubles up within the same per-minute window - see
+  // STOCK_MEMO_STAGGER_MS and dispatchStockMemoQueue below.
+  var STOCK_MEMO_MAX_CONCURRENT = 1;
+  var STOCK_MEMO_STAGGER_MS = 2000; // minimum gap between two dispatches starting, even with a free concurrency slot - matches HireHop's own documented "2 second delay per loop cycle" guidance, leaving roughly half the account's 60/minute budget free for HireHop's own native traffic on the same screen
   var STOCK_MEMO_RETRY_COOLDOWN_MS = 15000; // after a failed fetch, don't ask again for this item until this long has passed
   // Stock item memos live on the equipment's catalogue record, not the
   // job, so they're shared across every job that uses that item and
