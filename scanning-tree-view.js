@@ -1372,11 +1372,24 @@
     if (stockMemo === undefined) {
       requestStockMemo(instance, rowData);
     } else if (stockMemo && stockMemo !== true) {
-      $('<span>', {
-        'class': 'wh_stock_memo_inline',
-        text: 'Reminder: ' + stockMemo,
-        style: PILL_STYLE_RED
-      }).appendTo(container);
+      // HireHop appears to copy the stock item's catalogue memo onto a
+      // job line's own MEMO field at the moment the item is added to a
+      // job (confirmed live, 12 October 2026 - a one-time snapshot, not
+      // a live link). When that's happened, this pill and the yellow
+      // one just below would show the exact same text twice. Comparing
+      // trimmed strings (not raw equality) absorbs incidental
+      // whitespace differences while still catching the real
+      // duplicate-text case; a job line's own distinct note (e.g. "As
+      // many as you can find") never matches, so this never hides a
+      // genuinely different reminder.
+      var jobLineMemoTrimmed = rowData.MEMO ? String(rowData.MEMO).trim() : '';
+      if (String(stockMemo).trim() !== jobLineMemoTrimmed) {
+        $('<span>', {
+          'class': 'wh_stock_memo_inline',
+          text: 'Reminder: ' + stockMemo,
+          style: PILL_STYLE_RED
+        }).appendTo(container);
+      }
     }
 
     if (rowData.MEMO) {
