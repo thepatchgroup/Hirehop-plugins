@@ -1048,9 +1048,77 @@
   var stockMemoCache = {};
   var stockMemoInFlight = 0;
   var stockMemoQueue = []; // {instance, rowData, key} waiting their turn - see requestStockMemo
-  var stockMemoLastDispatch = 0;
+  var stockMemoLastDispatch = 0; // this tab's own view of the last dispatch time - see claimDispatchSlot for why this alone isn't enough once multiple tabs are involved
   var stockMemoFailedAt = {}; // key -> Date.now() of its last failure, for the retry cooldown
   var stockMemoDispatchTimer = null;
+
+  // Confirmed live (12 October 2026): staff often have several scanning
+  // tabs/windows open on the same browser at once. STOCK_MEMO_STAGGER_MS
+  // alone only paces THIS tab's own requests - with N tabs each pacing
+  // independently at the same rate, the combined rate across all of them
+  // is N times faster, which could burn through HireHop's shared
+  // 60-requests/minute account budget on its own even at a
+  // per-tab-safe-looking pace. These two keep every tab/window of this
+  // origin coordinated against ONE shared pace instead of each tab
+  // having its own: the timestamp lives in localStorage (visible to
+  // every tab), and claimDispatchSlot below uses the Web Locks API so
+  // two tabs can't both read-then-write it at the same moment and
+  // accidentally dispatch together.
+  var STOCK_MEMO_SHARED_DISPATCH_KEY = PERSIST_PREFIX + 'stock_memo_last_dispatch';
+  var STOCK_MEMO_LOCK_NAME = 'wh_plugin_stock_memo_dispatch';
+
+  function readSharedLastDispatch() {
+    try {
+      var v = localStorage.getItem(STOCK_MEMO_SHARED_DISPATCH_KEY);
+      return v ? (parseInt(v, 10) || 0) : 0;
+    } catch (e) {
+      return 0;
+    }
+  }
+
+  function writeSharedLastDispatch(ts) {
+    try {
+      localStorage.setItem(STOCK_MEMO_SHARED_DISPATCH_KEY, String(ts));
+    } catch (e) {
+      // localStorage unavailable (private browsing, quota, kiosk lockdown)
+      // - falls back to this tab's own in-memory-only pacing below.
+    }
+  }
+
+  // Atomically checks-and-claims the next dispatch slot against the
+  // shared, cross-tab last-dispatch time, calling back with how many ms
+  // to wait (0 if the slot was claimed now). The Web Locks API serializes
+  // this tiny synchronous check-and-write across every tab/frame of this
+  // origin - the lock is held only for that instant, never for the
+  // actual fetch itself, so it doesn't serialize requests beyond the
+  // pacing decision. Falls back to this tab's own last dispatch only
+  // (today's pre-12-October behaviour) in browsers without
+  // navigator.locks (older Safari, some embedded/kiosk webviews).
+  function claimDispatchSlot(cb) {
+    function localFallback() {
+      var waitMs = STOCK_MEMO_STAGGER_MS - (Date.now() - stockMemoLastDispatch);
+      if (waitMs <= 0) stockMemoLastDispatch = Date.now();
+      cb(Math.max(0, waitMs));
+    }
+    if (!window.navigator || !navigator.locks || !navigator.locks.request) {
+      localFallback();
+      return;
+    }
+    navigator.locks.request(STOCK_MEMO_LOCK_NAME, function () {
+      var last = Math.max(readSharedLastDispatch(), stockMemoLastDispatch);
+      var waitMs = STOCK_MEMO_STAGGER_MS - (Date.now() - last);
+      if (waitMs <= 0) {
+        var now = Date.now();
+        stockMemoLastDispatch = now;
+        writeSharedLastDispatch(now);
+      }
+      cb(Math.max(0, waitMs));
+    }).catch(function () {
+      // Lock request itself failed (e.g. the API exists but threw) -
+      // degrade to this tab's own pacing rather than blocking fetches.
+      localFallback();
+    });
+  }
 
   // Looks up whether we already know this item's memo - checking the
   // in-memory cache first, then falling back to (and seeding from) the
@@ -1096,15 +1164,15 @@
         stockMemoDispatchTimer = setTimeout(tick, STOCK_MEMO_STAGGER_MS);
         return;
       }
-      var wait = STOCK_MEMO_STAGGER_MS - (Date.now() - stockMemoLastDispatch);
-      if (wait > 0) {
-        stockMemoDispatchTimer = setTimeout(tick, wait);
-        return;
-      }
-      stockMemoLastDispatch = Date.now();
-      var job = stockMemoQueue.shift();
-      fetchStockMemo(job.instance, job.rowData, job.key);
-      if (stockMemoQueue.length) stockMemoDispatchTimer = setTimeout(tick, STOCK_MEMO_STAGGER_MS);
+      claimDispatchSlot(function (waitMs) {
+        if (waitMs > 0) {
+          stockMemoDispatchTimer = setTimeout(tick, waitMs);
+          return;
+        }
+        var job = stockMemoQueue.shift();
+        fetchStockMemo(job.instance, job.rowData, job.key);
+        if (stockMemoQueue.length) stockMemoDispatchTimer = setTimeout(tick, STOCK_MEMO_STAGGER_MS);
+      });
     };
     tick();
   }
