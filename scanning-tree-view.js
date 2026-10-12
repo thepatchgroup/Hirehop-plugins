@@ -1111,6 +1111,18 @@
         return res.json();
       })
       .then(function (info) {
+        // Confirmed live (12 October 2026): this endpoint intermittently
+        // returns HTTP 200 with a valid-JSON {"error":<code>} body for a
+        // request that, retried, succeeds normally with real data - not
+        // tied to request rate/burst size, just an occasional flaky
+        // response from the backend. Treating this as "no memo" (the
+        // old behaviour) silently and permanently poisoned the cache
+        // with a false-empty result for genuinely memo'd items. Route
+        // it into the same catch/retry-after-cooldown path as a network
+        // failure instead of accepting it as a real answer.
+        if (info && info.error !== undefined) {
+          throw new Error('API error ' + info.error);
+        }
         var memo = (info && info.memo) ? String(info.memo) : '';
         stockMemoCache[key] = memo;
         delete stockMemoFailedAt[key];
