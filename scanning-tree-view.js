@@ -123,38 +123,48 @@
  *    Three distinct kinds of note, from two different places in
  *    HireHop, shown inline on the scan grid's item rows (all three of
  *    Tree/List/Grouped):
- *      - Stock item memo - a general note set once on the equipment's
- *        own catalogue record (e.g. "Make sure I have a threaded
- *        insert"), the same for every job that uses that piece of
- *        kit. HireHop shows this today only inside the "View details"
- *        popup (double-click an item, or the toolbar's "View details"
- *        button) - no inline indicator at all otherwise. Shown first,
- *        in red, prefaced "Reminder:". Not part of the scan data
- *        already loaded - fetched on demand from
- *        /modules/scanning/get_item_info.php (the same endpoint that
- *        popup uses; same-origin, existing session cookie, no API
- *        token needed), once per distinct item and cached in
- *        localStorage for STOCK_MEMO_PERSIST_MAX_AGE_MS (6 hours) -
- *        this is a catalogue-level value, the same across every job
- *        that uses the item, so a value learned on one job's screen
- *        is reused on every other job's too, and reloading the same
- *        screen doesn't re-fetch items it already knows about.
- *        Fetches are both capped (STOCK_MEMO_MAX_CONCURRENT) AND
- *        paced at least STOCK_MEMO_STAGGER_MS apart, so a big job with
- *        many distinct items doesn't fire them all in one burst - see
- *        the comment above STOCK_MEMO_MAX_CONCURRENT for why that
- *        actually matters (it's what was tripping myhirehop.com's
- *        rate-limiting on big jobs, with knock-on effects on every
- *        other open tab for about a minute after). A failed fetch
- *        (including a rate-limit block) is retried after a short
- *        cooldown rather than permanently remembered as "no memo".
- *        There's no bulk/multi-item variant of this endpoint to call
- *        instead (checked directly against a live job - passing
- *        several ids, in a couple of different forms, just silently
- *        resolves to one item or none), so caching this value rather
- *        than re-asking every reload is the available alternative to
- *        a one-request-per-item burst, not a second-best substitute
- *        for a batch call that could exist instead.
+ *      - Stock item reminder - a note set once on the equipment's own
+ *        catalogue record (e.g. "Make sure I have a threaded insert"),
+ *        the same for every job that uses that piece of kit. Shown
+ *        first, in red, prefaced "Reminder:". Sourced from the
+ *        `prep_reminder` custom field (Settings > Custom fields > Hire
+ *        stock), added 12 October 2026 specifically so this value
+ *        stays independent of the job-line MEMO field below - HireHop's
+ *        own "add item to job" logic turns out to copy the OLD
+ *        catalogue memo field onto a job line's MEMO at the moment the
+ *        item's added (a one-time snapshot, confirmed live), which used
+ *        to show the exact same text twice (this pill and the yellow
+ *        one below) once a job was built after that memo existed - a
+ *        custom field HireHop's core logic has no knowledge of never
+ *        gets copied that way, so that collision can't happen going
+ *        forward. For an item that hasn't been migrated to the custom
+ *        field yet, this falls back to the legacy catalogue MEMO field
+ *        instead, so nothing regresses mid-migration - see
+ *        resolveReminderText. The trim-compare duplicate check in
+ *        appendInlineNotes is kept as a defensive leftover from the old
+ *        field's copy-at-add-time behaviour, in case that fallback
+ *        value ever happens to match a job line's own note.
+ *
+ *        Not part of the scan data already loaded, and not fetched
+ *        per-item either - resolved from a catalogue-wide cache kept
+ *        fresh in the background. /modules/stock/list.php (the same
+ *        endpoint behind the Hire stock management grid) returns every
+ *        item's legacy MEMO field AND its CUSTOM_FIELDS (prep_reminder
+ *        included) together, paginated up to 100 rows per call -
+ *        confirmed live, 12 October 2026. Unlike get_item_info.php
+ *        (used by HireHop's own "View details" popup, and by an earlier
+ *        version of this plugin - see the project doc's history), this
+ *        can't be filtered down to just the items one job needs (an
+ *        ID-list filter was tried live, several forms, and silently
+ *        ignored by the backend), but with roughly 1,100 items in the
+ *        whole catalogue that doesn't matter: fetching every page once
+ *        and caching the result (CATALOGUE_REFRESH_MAX_AGE_MS, 6 hours)
+ *        is around a dozen requests total, SHARED by every job and
+ *        every open tab, rather than up to 100+ requests per big job's
+ *        single page load under the old per-item approach - see the
+ *        catalogue-cache section below for the full account, including
+ *        why a couple of small safeguards are still worth keeping even
+ *        at this much lower request volume.
  *      - Item memo - a note typed once for this specific job's hire
  *        line (the MEMO field). Already in the loaded scan data, and
  *        HireHop already shows a small file-text icon for it with the
@@ -275,35 +285,38 @@
   var SYNC_POLL_INTERVAL_MS = 1500;
 
   // --- Lightweight persistent cache (localStorage-backed) ---
-  // Used below by both the Warehouse Notes fetch and the stock item
-  // memo fetches, to survive page reloads. These scanning screens get
-  // reloaded constantly in practice (switching jobs, pulling to
+  // Used below by the Warehouse Notes fetch and the catalogue-wide
+  // reminder cache, to survive page reloads. These scanning screens
+  // get reloaded constantly in practice (switching jobs, pulling to
   // refresh on a warehouse's handheld Android scanners) and the data
-  // involved - a job's warehouse note, an item's catalogue memo -
-  // rarely changes minute to minute, so re-fetching all of it fresh on
-  // every single reload is wasted work: slow and battery-draining on
-  // those low-powered scanners, and it's also what was tripping
+  // involved - a job's warehouse note, the catalogue's reminder text -
+  // rarely changes minute to minute, so re-fetching it fresh on every
+  // single reload is wasted work: slow and battery-draining on those
+  // low-powered scanners, and it's also what was tripping
   // myhirehop.com's CloudFront rate-limiting (a big job's Prep/Check-
-  // out screen could fire 100+ item-memo requests on every reload -
-  // see the stock-memo section below). A value fetched once is kept
-  // here and reused on later loads until it goes stale, rather than
-  // re-fetched every time.
+  // out screen could fire 100+ item-memo requests on every reload,
+  // back when reminders were fetched per item - see the catalogue
+  // reminder cache section below for how that's avoided now). A value
+  // fetched once is kept here and reused on later loads until it goes
+  // stale, rather than re-fetched every time.
   //
-  // This is deliberately a cache, not a batch request - there's no way
-  // to ask HireHop for several items' catalogue memos in one call to
-  // fall back on instead: confirmed directly against
-  // get_item_info.php on a live job that passing several ids (both
-  // list_id=1,2,3 and list_id[]=1&list_id[]=2 forms) does NOT return
-  // several items' data - it just silently resolves to one item (or
-  // none), the same way the endpoint behaves for the single-id calls
-  // this plugin already made before this change. The job-wide listing
-  // endpoint that DOES return every item in one call
-  // (get_prep_list.php, used by the Prep Progress bar below) doesn't
-  // carry this catalogue-level memo field at all - only the
-  // job-line-specific MEMO field (the separate, already-loaded yellow
-  // pill). So the per-item request is the only way to get this value,
-  // and caching it is what keeps that request from repeating every
-  // time the screen reloads.
+  // The catalogue reminder cache below replaced a one-request-per-item
+  // design specifically because there was no way to batch that
+  // request: confirmed directly against get_item_info.php on a live
+  // job that passing several ids (both list_id=1,2,3 and
+  // list_id[]=1&list_id[]=2 forms) does NOT return several items'
+  // data - it just silently resolves to one item (or none). The
+  // catalogue-wide listing endpoint (/modules/stock/list.php, used by
+  // the Hire stock management grid) does return many items per
+  // request, paginated - just not filtered down to a specific set of
+  // ids (confirmed live: an "in" condition with an array value throws
+  // a PHP error, and multiple "equal" conditions joined with OR are
+  // silently ignored) - so the whole catalogue is paged through and
+  // cached instead of asking per item. The job-wide listing endpoint
+  // that DOES return every item in one call (get_prep_list.php, used
+  // by the Prep Progress bar below) doesn't carry this catalogue-level
+  // reminder field at all - only the job-line-specific MEMO field (the
+  // separate, already-loaded yellow pill).
   //
   // Each "bucket" (one localStorage key) holds every cached entry for
   // one kind of data as a single JSON blob, rather than one
@@ -1010,232 +1023,223 @@
     'display:block; flex-basis:100%; width:100%; box-sizing:border-box; white-space:normal;' +
     'word-break:break-word; margin-top:1px; font-size:0.78em; color:#777; font-style:italic;';
 
-  // Gentle, on purpose: this plugin runs on low-powered handheld
-  // Android scanners as well as desktop browsers, and a big job can
-  // have 100+ distinct items each needing their own request (no bulk
-  // endpoint exists). The concurrency cap alone used to be the only
-  // throttle here, but these requests resolve almost instantly (small
-  // JSON, same server) - without a minimum gap between dispatches too,
-  // "3 at a time" collapses into a near-continuous burst.
+  // --- Catalogue-wide reminder cache (prep_reminder custom field) ---
+  // Replaces the old per-item get_item_info.php stock-memo fetch (the
+  // STOCK_MEMO_* constants/functions that used to live here are gone)
+  // now that the reminder lives in a dedicated custom field
+  // (`prep_reminder`, Settings > Custom fields > Hire stock) that
+  // HireHop's own add-item-to-job logic has no knowledge of, and so
+  // never copies onto a job line's own MEMO field the way it does the
+  // OLD catalogue memo field (confirmed live, 12 October 2026 - see
+  // the trim-compare check in appendInlineNotes, kept as a defensive
+  // leftover from that era in case the fallback value below ever
+  // happens to match a job line's own note).
   //
-  // Confirmed live against HireHop's own published API docs
-  // (hirehop.co.uk/api_documentation, 12 October 2026): HireHop
-  // enforces a hard 60-requests-per-minute limit PER ACCOUNT (HTTP 429,
-  // "User error: 429 Too many requests per minute" - reproduced live),
-  // shared across EVERYTHING that account does - HireHop's own native
-  // page traffic on the same screen AND every request this plugin
-  // makes, all counted against the same budget. The docs explicitly
-  // discourage looping requests and recommend a 2-second delay per
-  // cycle if you must. An earlier version of this throttle (2
-  // concurrent, 200ms stagger - roughly 300 requests/minute at full
-  // tilt) was never going to be safe against a 60/minute account-wide
-  // ceiling shared with native traffic, regardless of CloudFront's own
-  // separate, cruder IP-level rate-based WAF rule (which a burst well
-  // beyond even that pace also tripped, confirmed live, with the whole
-  // site - not just this endpoint - 403ing for several minutes after).
-  // Paced well under the documented budget, with concurrency 1 so nothing
-  // doubles up within the same per-minute window - see
-  // STOCK_MEMO_STAGGER_MS and dispatchStockMemoQueue below.
-  var STOCK_MEMO_MAX_CONCURRENT = 1;
-  var STOCK_MEMO_STAGGER_MS = 2000; // minimum gap between two dispatches starting, even with a free concurrency slot - matches HireHop's own documented "2 second delay per loop cycle" guidance, leaving roughly half the account's 60/minute budget free for HireHop's own native traffic on the same screen
-  var STOCK_MEMO_RETRY_COOLDOWN_MS = 15000; // after a failed fetch, don't ask again for this item until this long has passed
-  // Stock item memos live on the equipment's catalogue record, not the
-  // job, so they're shared across every job that uses that item and
-  // rarely change - a long persisted TTL is safe and saves the most.
-  var STOCK_MEMO_PERSIST_MAX_AGE_MS = 6 * 60 * 60 * 1000; // 6 hours
+  // For an item that hasn't been migrated to the custom field yet,
+  // resolveReminderText below falls back to the legacy MEMO field, so
+  // nothing regresses mid-migration - both values come back from the
+  // very same request (see fetchCataloguePage), so there's no extra
+  // cost to supporting the fallback.
+  //
+  // /modules/stock/list.php (the same endpoint behind the Hire stock
+  // management grid) returns every item's legacy MEMO field AND its
+  // CUSTOM_FIELDS together, paginated up to CATALOGUE_PAGE_ROWS rows
+  // per call - confirmed live, 12 October 2026. Unlike
+  // get_item_info.php, there's no way to filter this down to just the
+  // items one job needs (an ID-list filter was tried live - several
+  // different forms - and silently ignored by the backend, always
+  // returning the default unfiltered page), but with roughly 1,100
+  // items in the whole catalogue that doesn't matter: fetching every
+  // page once and caching the result (CATALOGUE_REFRESH_MAX_AGE_MS) is
+  // around a dozen requests total, SHARED by every job and every open
+  // tab on a device (see CATALOGUE_REFRESH_LOCK_NAME), rather than up
+  // to 100+ requests per big job's single page load under the old
+  // per-item approach - but per DEVICE, not account-wide: each
+  // separate browser/device keeps its own independent cache, same as
+  // the Warehouse Notes cache above already does. A refresh this
+  // infrequent and this small sits nowhere near HireHop's documented
+  // 60-requests/minute account limit even unthrottled, but two things
+  // are still worth guarding against with multiple tabs in play (see
+  // the project doc's "Rate-limit correction"/"Cross-tab coordination"
+  // sections for the full history of why):
+  //   - several tabs' caches going stale at the same moment and all
+  //     deciding to refresh the whole catalogue at once - guarded by
+  //     CATALOGUE_REFRESH_LOCK_NAME (Web Locks API), the same
+  //     coordination pattern the old per-item dispatch used, just
+  //     applied to "claim the refresh" instead of "claim the next
+  //     per-item slot";
+  //   - a single tab firing all dozen-or-so page requests back to back
+  //     with no gap, which risks tripping CloudFront's separate,
+  //     cruder burst-rate WAF rule (NOT the same thing as the
+  //     documented account limit above - see the Gotchas section) -
+  //     guarded by CATALOGUE_REFRESH_PAGE_STAGGER_MS.
+  var PREP_REMINDER_FIELD = 'prep_reminder';
+  var CATALOGUE_LIST_URL = '/modules/stock/list.php';
+  var CATALOGUE_PAGE_ROWS = 100;
+  var CATALOGUE_REFRESH_PAGE_STAGGER_MS = 600;
+  // Catalogue-level data, rarely changes minute to minute - same
+  // reasoning as the old per-item TTL it replaces.
+  var CATALOGUE_REFRESH_MAX_AGE_MS = 6 * 60 * 60 * 1000; // 6 hours
+  // After a failed refresh, back off for a while rather than retrying
+  // on every single screen load - avoids hammering a persistently
+  // failing endpoint.
+  var CATALOGUE_REFRESH_FAILURE_COOLDOWN_MS = 5 * 60 * 1000; // 5 minutes
+  // How often this tab will even consult localStorage to check whether
+  // a refresh is due - ensureCatalogueFresh is cheap either way, but
+  // there's no reason to read localStorage on every single row render
+  // when nothing's going to change between one render pass and the
+  // next, moments later.
+  var CATALOGUE_CHECK_THROTTLE_MS = 10000;
+  var CATALOGUE_META_KEY = PERSIST_PREFIX + 'catalogue_reminders_meta';
+  var CATALOGUE_REFRESH_LOCK_NAME = 'wh_plugin_catalogue_refresh';
+  var CATALOGUE_CACHE_BUCKET = 'catalogue_reminders';
 
-  // Keyed by "<LIST_ID>:<TYPE>" - the same two values get_item_info.php
-  // itself is keyed on (deliberately not scoped to a job id - this is
-  // a catalogue-level memo, the same for every job that uses that
-  // item). Value is the memo string once known ('' if the item
-  // genuinely has none, so we don't ask again), or `true` while a
-  // fetch for it is in flight OR queued. Seeded lazily from the
-  // persisted cache (see getKnownStockMemo) rather than all at once on
-  // load, since most pages only ever look up a fraction of the items
-  // that have ever been cached.
-  var stockMemoCache = {};
-  var stockMemoInFlight = 0;
-  var stockMemoQueue = []; // {instance, rowData, key} waiting their turn - see requestStockMemo
-  var stockMemoLastDispatch = 0; // this tab's own view of the last dispatch time - see claimDispatchSlot for why this alone isn't enough once multiple tabs are involved
-  var stockMemoFailedAt = {}; // key -> Date.now() of its last failure, for the retry cooldown
-  var stockMemoDispatchTimer = null;
+  var catalogueReminderCache = {}; // stock item ID (string) -> {memo, prep_reminder}
+  var catalogueLastCheckedAt = 0; // this tab's own throttle on how often ensureCatalogueFresh does anything at all
 
-  // Confirmed live (12 October 2026): staff often have several scanning
-  // tabs/windows open on the same browser at once. STOCK_MEMO_STAGGER_MS
-  // alone only paces THIS tab's own requests - with N tabs each pacing
-  // independently at the same rate, the combined rate across all of them
-  // is N times faster, which could burn through HireHop's shared
-  // 60-requests/minute account budget on its own even at a
-  // per-tab-safe-looking pace. These two keep every tab/window of this
-  // origin coordinated against ONE shared pace instead of each tab
-  // having its own: the timestamp lives in localStorage (visible to
-  // every tab), and claimDispatchSlot below uses the Web Locks API so
-  // two tabs can't both read-then-write it at the same moment and
-  // accidentally dispatch together.
-  var STOCK_MEMO_SHARED_DISPATCH_KEY = PERSIST_PREFIX + 'stock_memo_last_dispatch';
-  var STOCK_MEMO_LOCK_NAME = 'wh_plugin_stock_memo_dispatch';
-
-  function readSharedLastDispatch() {
+  function readCatalogueMeta() {
     try {
-      var v = localStorage.getItem(STOCK_MEMO_SHARED_DISPATCH_KEY);
-      return v ? (parseInt(v, 10) || 0) : 0;
+      var raw = localStorage.getItem(CATALOGUE_META_KEY);
+      var obj = raw ? JSON.parse(raw) : null;
+      return (obj && typeof obj === 'object') ? obj : {};
     } catch (e) {
-      return 0;
+      return {};
     }
   }
 
-  function writeSharedLastDispatch(ts) {
+  function writeCatalogueMeta(meta) {
     try {
-      localStorage.setItem(STOCK_MEMO_SHARED_DISPATCH_KEY, String(ts));
+      localStorage.setItem(CATALOGUE_META_KEY, JSON.stringify(meta));
     } catch (e) {
-      // localStorage unavailable (private browsing, quota, kiosk lockdown)
-      // - falls back to this tab's own in-memory-only pacing below.
+      // localStorage unavailable - the refresh itself still worked (if
+      // it did), just without remembering that for next time; worst
+      // case this tab re-checks (and maybe re-refreshes) more often
+      // than it strictly needs to.
     }
   }
 
-  // Atomically checks-and-claims the next dispatch slot against the
-  // shared, cross-tab last-dispatch time, calling back with how many ms
-  // to wait (0 if the slot was claimed now). The Web Locks API serializes
-  // this tiny synchronous check-and-write across every tab/frame of this
-  // origin - the lock is held only for that instant, never for the
-  // actual fetch itself, so it doesn't serialize requests beyond the
-  // pacing decision. Falls back to this tab's own last dispatch only
-  // (today's pre-12-October behaviour) in browsers without
-  // navigator.locks (older Safari, some embedded/kiosk webviews).
-  function claimDispatchSlot(cb) {
-    function localFallback() {
-      var waitMs = STOCK_MEMO_STAGGER_MS - (Date.now() - stockMemoLastDispatch);
-      if (waitMs <= 0) stockMemoLastDispatch = Date.now();
-      cb(Math.max(0, waitMs));
-    }
-    if (!window.navigator || !navigator.locks || !navigator.locks.request) {
-      localFallback();
-      return;
-    }
-    navigator.locks.request(STOCK_MEMO_LOCK_NAME, function () {
-      var last = Math.max(readSharedLastDispatch(), stockMemoLastDispatch);
-      var waitMs = STOCK_MEMO_STAGGER_MS - (Date.now() - last);
-      if (waitMs <= 0) {
-        var now = Date.now();
-        stockMemoLastDispatch = now;
-        writeSharedLastDispatch(now);
-      }
-      cb(Math.max(0, waitMs));
-    }).catch(function () {
-      // Lock request itself failed (e.g. the API exists but threw) -
-      // degrade to this tab's own pacing rather than blocking fetches.
-      localFallback();
-    });
-  }
-
-  // Looks up whether we already know this item's memo - checking the
-  // in-memory cache first, then falling back to (and seeding from) the
-  // persisted one - WITHOUT queuing a fetch if we don't. Returns
-  // undefined if genuinely unknown, `true` if a fetch is in
-  // flight/queued, or the memo string (possibly '') once known.
-  function getKnownStockMemo(key) {
-    if (stockMemoCache.hasOwnProperty(key)) return stockMemoCache[key];
-    var persisted = persistGet('stock_memo', key, STOCK_MEMO_PERSIST_MAX_AGE_MS);
-    if (persisted !== undefined) {
-      stockMemoCache[key] = persisted;
-      return persisted;
+  // Looks up whatever we currently have cached for this stock item id,
+  // WITHOUT triggering a fetch - checking the in-memory cache first,
+  // then falling back to (and seeding from) the persisted one. Returns
+  // undefined if this item has never been cached at all (e.g. the
+  // catalogue refresh hasn't completed yet), or {memo, prep_reminder}
+  // once known - either field may legitimately be ''.
+  function getCachedReminder(id) {
+    var key = String(id);
+    if (catalogueReminderCache.hasOwnProperty(key)) return catalogueReminderCache[key];
+    var bucket = loadPersistBucket(CATALOGUE_CACHE_BUCKET);
+    var entry = bucket[key];
+    if (entry && entry.v) {
+      catalogueReminderCache[key] = entry.v;
+      return entry.v;
     }
     return undefined;
   }
 
-  // Queues a stock-memo fetch for this item unless it's already known,
-  // in flight, queued, or still cooling down after a recent failure.
-  // Queuing rather than fetching immediately (as this used to) is what
-  // lets dispatchStockMemoQueue actually throttle the rate requests
-  // leave the browser at, rather than just how many are open at once.
-  function requestStockMemo(instance, rowData) {
-    var key = rowData.LIST_ID + ':' + rowData.TYPE;
-    if (getKnownStockMemo(key) !== undefined) return;
-    var failedAt = stockMemoFailedAt[key];
-    if (failedAt && (Date.now() - failedAt) < STOCK_MEMO_RETRY_COOLDOWN_MS) return;
-    stockMemoCache[key] = true;
-    stockMemoQueue.push({ instance: instance, rowData: rowData, key: key });
-    dispatchStockMemoQueue();
+  function setCachedReminder(id, value) {
+    var key = String(id);
+    catalogueReminderCache[key] = value;
+    persistSet(CATALOGUE_CACHE_BUCKET, key, value);
   }
 
-  // Drains stockMemoQueue at a throttled rate: at most
-  // STOCK_MEMO_MAX_CONCURRENT requests in flight at once, AND at least
-  // STOCK_MEMO_STAGGER_MS between any two requests actually starting -
-  // see the header note on STOCK_MEMO_MAX_CONCURRENT above for why the
-  // concurrency cap alone isn't enough on its own.
-  function dispatchStockMemoQueue() {
-    if (stockMemoDispatchTimer) return;
-    var tick = function () {
-      stockMemoDispatchTimer = null;
-      if (!stockMemoQueue.length) return;
-      if (stockMemoInFlight >= STOCK_MEMO_MAX_CONCURRENT) {
-        stockMemoDispatchTimer = setTimeout(tick, STOCK_MEMO_STAGGER_MS);
-        return;
-      }
-      claimDispatchSlot(function (waitMs) {
-        if (waitMs > 0) {
-          stockMemoDispatchTimer = setTimeout(tick, waitMs);
-          return;
+  // The text appendInlineNotes should actually show for this item, or
+  // undefined if we don't know yet. Prefers the new prep_reminder
+  // custom field; falls back to the legacy catalogue memo field for an
+  // item that hasn't been migrated to the custom field yet, so nothing
+  // regresses mid-migration. '' (from either field) means "known, and
+  // genuinely has no reminder" - same convention the old stock-memo
+  // cache used.
+  function resolveReminderText(id) {
+    var entry = getCachedReminder(id);
+    if (!entry) return undefined;
+    return entry[PREP_REMINDER_FIELD] || entry.memo || '';
+  }
+
+  function fetchCataloguePage(page) {
+    var url = CATALOGUE_LIST_URL +
+      '?pq_datatype=JSON' +
+      '&pq_sort=' + encodeURIComponent(JSON.stringify([{ dataIndx: 'ID', dir: 'up', dataType: 'int' }])) +
+      '&rows=' + CATALOGUE_PAGE_ROWS +
+      '&page=' + page +
+      '&USE_CATEGORY_TREE=1&cats=[]&show_hidden=1&inc_virtual=1';
+    return fetch(url, { credentials: 'same-origin' }).then(function (res) {
+      if (!res.ok) throw new Error('HTTP ' + res.status);
+      return res.json();
+    });
+  }
+
+  // Walks every page of the catalogue, caching each item's legacy MEMO
+  // and prep_reminder custom field as pages arrive (so even a refresh
+  // interrupted partway - e.g. the tab closed - leaves whatever was
+  // fetched so far usable, rather than throwing all of it away), and
+  // asks for a grid refresh after each page so reminder pills appear
+  // progressively rather than all at once at the end. The overall
+  // "refreshed" timestamp is only written once every page has
+  // succeeded, so a partial/failed refresh is correctly treated as
+  // still due next time rather than being considered fresh on
+  // incomplete data.
+  function doCatalogueRefresh(instance) {
+    var page = 0;
+    function nextPage() {
+      return fetchCataloguePage(page).then(function (resp) {
+        var rows = (resp && resp.data) || [];
+        rows.forEach(function (row) {
+          var cf = row.CUSTOM_FIELDS && row.CUSTOM_FIELDS[PREP_REMINDER_FIELD];
+          var reminder = (cf && cf.value) ? String(cf.value) : '';
+          var memo = row.MEMO ? String(row.MEMO) : '';
+          setCachedReminder(row.ID, { memo: memo, prep_reminder: reminder });
+        });
+        if (instance) scheduleGridRefresh(instance);
+        var totalRecords = (resp && resp.totalRecords) || 0;
+        var fetchedSoFar = (page + 1) * CATALOGUE_PAGE_ROWS;
+        page++;
+        if (rows.length && fetchedSoFar < totalRecords) {
+          return new Promise(function (resolve) {
+            setTimeout(resolve, CATALOGUE_REFRESH_PAGE_STAGGER_MS);
+          }).then(nextPage);
         }
-        var job = stockMemoQueue.shift();
-        fetchStockMemo(job.instance, job.rowData, job.key);
-        if (stockMemoQueue.length) stockMemoDispatchTimer = setTimeout(tick, STOCK_MEMO_STAGGER_MS);
       });
-    };
-    tick();
-  }
-
-  function fetchStockMemo(instance, rowData, key) {
-    stockMemoInFlight++;
-    var url = '/modules/scanning/get_item_info.php' +
-      '?job_id=' + encodeURIComponent(rowData.JOB_ID) +
-      '&main_id=' + encodeURIComponent(instance.options.main_id) +
-      '&kind=' + encodeURIComponent(instance.options.kind) +
-      '&list_id=' + encodeURIComponent(rowData.LIST_ID) +
-      '&type=' + encodeURIComponent(rowData.TYPE);
-    fetch(url, { credentials: 'same-origin' })
-      .then(function (res) {
-        if (!res.ok) throw new Error('HTTP ' + res.status); // e.g. the 403 a rate-limit block returns
-        return res.json();
-      })
-      .then(function (info) {
-        // Confirmed live (12 October 2026): this endpoint intermittently
-        // returns HTTP 200 with a valid-JSON {"error":<code>} body for a
-        // request that, retried, succeeds normally with real data - not
-        // tied to request rate/burst size, just an occasional flaky
-        // response from the backend. Treating this as "no memo" (the
-        // old behaviour) silently and permanently poisoned the cache
-        // with a false-empty result for genuinely memo'd items. Route
-        // it into the same catch/retry-after-cooldown path as a network
-        // failure instead of accepting it as a real answer.
-        if (info && info.error !== undefined) {
-          throw new Error('API error ' + info.error);
-        }
-        var memo = (info && info.memo) ? String(info.memo) : '';
-        stockMemoCache[key] = memo;
-        delete stockMemoFailedAt[key];
-        persistSet('stock_memo', key, memo);
+    }
+    return nextPage()
+      .then(function () {
+        writeCatalogueMeta({ refreshedAt: Date.now() });
       })
       .catch(function (e) {
-        console.warn('[scanning-tree-view plugin] could not load stock item memo', e);
-        // Don't cache a failure as "no memo" - that used to mean a
-        // single transient error (a network blip, or exactly this
-        // kind of rate-limit block) permanently blanked out an item's
-        // reminder for the rest of the page's life, with no retry.
-        // Drop the in-flight marker so it's eligible to be asked for
-        // again, after a short cooldown so a genuinely persistent
-        // error doesn't just retry in a tight loop.
-        delete stockMemoCache[key];
-        stockMemoFailedAt[key] = Date.now();
-      })
-      .then(function () {
-        stockMemoInFlight--;
-        // This item's row won't show its stock memo pill until it's
-        // re-rendered - ask for a refresh once this batch of fetches
-        // has settled (debounced below).
-        scheduleGridRefresh(instance);
-        if (stockMemoQueue.length) dispatchStockMemoQueue();
+        console.warn('[scanning-tree-view plugin] could not refresh catalogue reminders', e);
+        writeCatalogueMeta({ refreshedAt: (readCatalogueMeta().refreshedAt || 0), failedAt: Date.now() });
       });
+  }
+
+  // Kicks off a catalogue refresh if (and only if) one's actually due,
+  // coordinating across every open tab on this device so only one of
+  // them does it at a time - see the header comment above for the full
+  // reasoning. Cheap to call often: in the common case (already
+  // checked recently, or already fresh) this does nothing but compare
+  // a couple of timestamps.
+  function ensureCatalogueFresh(instance) {
+    var now = Date.now();
+    if (now - catalogueLastCheckedAt < CATALOGUE_CHECK_THROTTLE_MS) return;
+    catalogueLastCheckedAt = now;
+
+    var meta = readCatalogueMeta();
+    if (now - (meta.refreshedAt || 0) < CATALOGUE_REFRESH_MAX_AGE_MS) return; // fresh enough
+    if (meta.failedAt && (now - meta.failedAt) < CATALOGUE_REFRESH_FAILURE_COOLDOWN_MS) return; // recently failed - back off
+
+    if (window.navigator && navigator.locks && navigator.locks.request) {
+      navigator.locks.request(CATALOGUE_REFRESH_LOCK_NAME, { ifAvailable: true }, function (lock) {
+        if (!lock) return; // another tab on this device already has this - just use whatever's cached
+        return doCatalogueRefresh(instance);
+      }).catch(function () {
+        // Lock request itself failed (e.g. the API exists but threw) -
+        // degrade to doing it directly rather than never refreshing.
+        doCatalogueRefresh(instance);
+      });
+    } else {
+      // No Web Locks API (older Safari, some embedded/kiosk webviews) -
+      // each tab paces/coordinates only with itself, same fallback
+      // philosophy as the old per-item dispatch used.
+      doCatalogueRefresh(instance);
+    }
   }
 
   // pqGrid lays out rows at a single configured height (option `rowHt`)
@@ -1367,26 +1371,27 @@
     // squeezed onto the same single line.
     container.style.flexWrap = 'wrap';
 
-    var key = rowData.LIST_ID + ':' + rowData.TYPE;
-    var stockMemo = getKnownStockMemo(key);
-    if (stockMemo === undefined) {
-      requestStockMemo(instance, rowData);
-    } else if (stockMemo && stockMemo !== true) {
-      // HireHop appears to copy the stock item's catalogue memo onto a
-      // job line's own MEMO field at the moment the item is added to a
-      // job (confirmed live, 12 October 2026 - a one-time snapshot, not
-      // a live link). When that's happened, this pill and the yellow
-      // one just below would show the exact same text twice. Comparing
+    var reminder = resolveReminderText(rowData.LIST_ID);
+    if (reminder) {
+      // HireHop copies the OLD catalogue memo field onto a job line's
+      // own MEMO field at the moment the item's added to a job
+      // (confirmed live, 12 October 2026 - a one-time snapshot, not a
+      // live link), which used to mean this pill and the yellow one
+      // just below could show the exact same text twice. The new
+      // prep_reminder custom field is never copied that way, so this
+      // can only still happen via the legacy-field fallback in
+      // resolveReminderText - kept as a defensive, cheap check even
+      // though it should rarely trigger going forward. Comparing
       // trimmed strings (not raw equality) absorbs incidental
       // whitespace differences while still catching the real
       // duplicate-text case; a job line's own distinct note (e.g. "As
       // many as you can find") never matches, so this never hides a
       // genuinely different reminder.
       var jobLineMemoTrimmed = rowData.MEMO ? String(rowData.MEMO).trim() : '';
-      if (String(stockMemo).trim() !== jobLineMemoTrimmed) {
+      if (String(reminder).trim() !== jobLineMemoTrimmed) {
         $('<span>', {
           'class': 'wh_stock_memo_inline',
-          text: 'Reminder: ' + stockMemo,
+          text: 'Reminder: ' + reminder,
           style: PILL_STYLE_RED
         }).appendTo(container);
       }
@@ -1463,6 +1468,7 @@
       // ensurePrepProgressBar) - order matters here.
       applyPrepProgress(this, this.options.main_id);
       applyWarehouseNote(this, this.options.kind, this.options.main_id);
+      ensureCatalogueFresh(this);
       return result;
     };
 
@@ -1519,6 +1525,7 @@
     applyTreeHideCompleted(instance);
     applyPrepProgress(instance, instance.options.main_id);
     applyWarehouseNote(instance, instance.options.kind, instance.options.main_id);
+    ensureCatalogueFresh(instance);
 
     // Safety net: some updates (deleting/undoing a scan, another
     // terminal's changes arriving over HireHop's real-time sync) turn
@@ -1537,6 +1544,16 @@
     setInterval(function () {
       refreshPrepProgress(instance);
     }, PREP_PROGRESS_POLL_INTERVAL_MS);
+
+    // Keeps a long-lived open tab's catalogue cache from going stale
+    // without needing a reload - ensureCatalogueFresh itself is cheap
+    // to call this often (an in-memory-only check in the common case,
+    // see CATALOGUE_CHECK_THROTTLE_MS), so this interval just has to be
+    // comfortably shorter than CATALOGUE_REFRESH_MAX_AGE_MS, not match
+    // it exactly.
+    setInterval(function () {
+      ensureCatalogueFresh(instance);
+    }, 30 * 60 * 1000); // 30 minutes
   }
 
   function findAndPatch() {
