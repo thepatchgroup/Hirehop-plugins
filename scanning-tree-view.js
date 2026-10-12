@@ -76,6 +76,11 @@
  *    embeds in that page - there's no dedicated JSON endpoint for
  *    this, so we parse it out of the HTML. Read-only: this doesn't
  *    let you edit the note from the scanning screen, only see it.
+ *    This full-page fetch is cached in localStorage per job id for
+ *    WAREHOUSE_NOTES_PERSIST_MAX_AGE_MS (10 minutes), so reloading the
+ *    same job's screen repeatedly - the normal way these screens get
+ *    used on a warehouse floor - doesn't re-fetch the whole job page
+ *    every single time.
  *    Only shown for job-level scans (Prep job / Check job out), and
  *    only when the note isn't empty - if there's nothing to say,
  *    nothing takes up any extra space, same as before this feature
@@ -128,8 +133,28 @@
  *        already loaded - fetched on demand from
  *        /modules/scanning/get_item_info.php (the same endpoint that
  *        popup uses; same-origin, existing session cookie, no API
- *        token needed), once per distinct item and cached for the
- *        rest of the session, with fetches capped to a few at a time.
+ *        token needed), once per distinct item and cached in
+ *        localStorage for STOCK_MEMO_PERSIST_MAX_AGE_MS (6 hours) -
+ *        this is a catalogue-level value, the same across every job
+ *        that uses the item, so a value learned on one job's screen
+ *        is reused on every other job's too, and reloading the same
+ *        screen doesn't re-fetch items it already knows about.
+ *        Fetches are both capped (STOCK_MEMO_MAX_CONCURRENT) AND
+ *        paced at least STOCK_MEMO_STAGGER_MS apart, so a big job with
+ *        many distinct items doesn't fire them all in one burst - see
+ *        the comment above STOCK_MEMO_MAX_CONCURRENT for why that
+ *        actually matters (it's what was tripping myhirehop.com's
+ *        rate-limiting on big jobs, with knock-on effects on every
+ *        other open tab for about a minute after). A failed fetch
+ *        (including a rate-limit block) is retried after a short
+ *        cooldown rather than permanently remembered as "no memo".
+ *        There's no bulk/multi-item variant of this endpoint to call
+ *        instead (checked directly against a live job - passing
+ *        several ids, in a couple of different forms, just silently
+ *        resolves to one item or none), so caching this value rather
+ *        than re-asking every reload is the available alternative to
+ *        a one-request-per-item burst, not a second-best substitute
+ *        for a batch call that could exist instead.
  *      - Item memo - a note typed once for this specific job's hire
  *        line (the MEMO field). Already in the loaded scan data, and
  *        HireHop already shows a small file-text icon for it with the
@@ -183,6 +208,44 @@
  *    applied, this time at the right height, with every row below it
  *    shifted down correctly and nothing overlapping.
  *
+ * 5) Prep Progress bar
+ *    A thin progress bar across the very top of the scanning screen -
+ *    above the Warehouse Notes banner/panel and above the
+ *    left_pane/grid_pane row, so it's the first thing visible on the
+ *    screen regardless of which scan "kind" is actually open. Always
+ *    shows the job's PREP JOB (kind 1) completion specifically, never
+ *    whatever kind the screen happens to be showing - so a Check-job-out
+ *    screen still shows "is this job fully prepped yet", which is
+ *    usually the more useful question at that point. Labelled "Prep
+ *    Progress", with the bar itself plus "<scanned> / <ordered>
+ *    (<pct>%)" text - not just a bare bar.
+ *
+ *    Data comes from /modules/scanning/get_prep_list.php?main_id=<job>
+ *    &kind=1 - a flat (non-tree) summary of every line on the job's Prep
+ *    job pass, each with `ordered`/`scanned`/`remain` counts. This is
+ *    fetched independently of whatever grid data the screen's own
+ *    "kind" has loaded (confirmed this returns full, correct totals even
+ *    when the screen itself is open on a completely different kind).
+ *    Totals are summed across every row that isn't a heading/comment
+ *    (TYPE 5/100 - see HEADING_TYPE/COMMENT_TYPE), clamping any
+ *    individual line's scanned count to its ordered count first so an
+ *    over-scanned item can't push the overall percentage past 100%.
+ *    Hidden entirely if the job has nothing on its Prep job pass
+ *    (ordered totals to 0) or the fetch fails - same "nothing to show,
+ *    so show nothing" convention as the Warehouse Notes panel.
+ *
+ *    Loaded once per job (on initial_data_loaded, and replayed if this
+ *    plugin attaches to an already-loaded screen), refreshed immediately
+ *    after any scan made while this screen itself is open on kind 1
+ *    (Prep job), and otherwise re-polled every
+ *    PREP_PROGRESS_POLL_INTERVAL_MS so it still catches prep work done
+ *    on another terminal, or another kind's screen, while this one sits
+ *    open. Being an always-visible, full-width row rather than something
+ *    conditionally shown by breakpoint (unlike the Warehouse Notes
+ *    panel/banner split), it has to shrink left_pane/grid_pane by its
+ *    own height too whenever it's visible, same mechanism already used
+ *    for the mobile notes banner (see shrinkForExtraRows).
+ *
  * Verified against HireHop's own scanning.js (pqgrid.min.js v11.2.1b)
  * on a live scanning screen in September/October 2026. If HireHop
  * changes the internals of the scanning module, this may need
@@ -210,6 +273,96 @@
   // How often (ms) to re-check that the tree view matches the live
   // scan data, as a safety net for updates that bypass our hooks.
   var SYNC_POLL_INTERVAL_MS = 1500;
+
+  // --- Lightweight persistent cache (localStorage-backed) ---
+  // Used below by both the Warehouse Notes fetch and the stock item
+  // memo fetches, to survive page reloads. These scanning screens get
+  // reloaded constantly in practice (switching jobs, pulling to
+  // refresh on a warehouse's handheld Android scanners) and the data
+  // involved - a job's warehouse note, an item's catalogue memo -
+  // rarely changes minute to minute, so re-fetching all of it fresh on
+  // every single reload is wasted work: slow and battery-draining on
+  // those low-powered scanners, and it's also what was tripping
+  // myhirehop.com's CloudFront rate-limiting (a big job's Prep/Check-
+  // out screen could fire 100+ item-memo requests on every reload -
+  // see the stock-memo section below). A value fetched once is kept
+  // here and reused on later loads until it goes stale, rather than
+  // re-fetched every time.
+  //
+  // This is deliberately a cache, not a batch request - there's no way
+  // to ask HireHop for several items' catalogue memos in one call to
+  // fall back on instead: confirmed directly against
+  // get_item_info.php on a live job that passing several ids (both
+  // list_id=1,2,3 and list_id[]=1&list_id[]=2 forms) does NOT return
+  // several items' data - it just silently resolves to one item (or
+  // none), the same way the endpoint behaves for the single-id calls
+  // this plugin already made before this change. The job-wide listing
+  // endpoint that DOES return every item in one call
+  // (get_prep_list.php, used by the Prep Progress bar below) doesn't
+  // carry this catalogue-level memo field at all - only the
+  // job-line-specific MEMO field (the separate, already-loaded yellow
+  // pill). So the per-item request is the only way to get this value,
+  // and caching it is what keeps that request from repeating every
+  // time the screen reloads.
+  //
+  // Each "bucket" (one localStorage key) holds every cached entry for
+  // one kind of data as a single JSON blob, rather than one
+  // localStorage key per item - and is capped at PERSIST_MAX_ENTRIES,
+  // oldest entries dropped first once it's exceeded. A real equipment
+  // catalogue or job list is nowhere near that cap in practice (at a
+  // few hundred bytes each, even the full cap is well under a
+  // megabyte), but the cap exists so this cache can never grow without
+  // bound and start weighing down the very low-powered devices it's
+  // meant to help, no matter how long the plugin keeps running for.
+  // Every call is wrapped in try/catch: some contexts (private
+  // browsing, a full storage quota, a locked-down kiosk browser
+  // profile) throw on any localStorage access at all, and this cache
+  // is a pure optimisation on top of the in-memory one each feature
+  // already keeps for the current page load - any failure here should
+  // just behave as "nothing persisted", never break the page.
+  var PERSIST_PREFIX = 'whplugin_cache:';
+  var PERSIST_MAX_ENTRIES = 2000; // per bucket
+
+  function loadPersistBucket(bucket) {
+    try {
+      var raw = localStorage.getItem(PERSIST_PREFIX + bucket);
+      var obj = raw ? JSON.parse(raw) : null;
+      return (obj && typeof obj === 'object') ? obj : {};
+    } catch (e) {
+      return {};
+    }
+  }
+
+  function persistGet(bucket, key, maxAgeMs) {
+    try {
+      var entry = loadPersistBucket(bucket)[key];
+      if (!entry || typeof entry.t !== 'number') return undefined;
+      if (Date.now() - entry.t > maxAgeMs) return undefined; // stale
+      return entry.v;
+    } catch (e) {
+      return undefined;
+    }
+  }
+
+  function persistSet(bucket, key, value) {
+    try {
+      var entries = loadPersistBucket(bucket);
+      entries[key] = { t: Date.now(), v: value };
+      var keys = Object.keys(entries);
+      if (keys.length > PERSIST_MAX_ENTRIES) {
+        // Over the cap: drop the oldest-written entries, plus a bit
+        // more headroom, so this isn't re-triggered on every single
+        // write once the cache is full.
+        keys.sort(function (a, b) { return entries[a].t - entries[b].t; });
+        var dropCount = keys.length - PERSIST_MAX_ENTRIES + Math.ceil(PERSIST_MAX_ENTRIES / 4);
+        for (var i = 0; i < dropCount; i++) delete entries[keys[i]];
+      }
+      localStorage.setItem(PERSIST_PREFIX + bucket, JSON.stringify(entries));
+    } catch (e) {
+      // Quota exceeded, storage disabled, etc. - skip persisting; the
+      // in-memory cache for this page load still works fine either way.
+    }
+  }
 
   // Tree node TYPE values that aren't real scannable items and have no
   // meaningful "remain" of their own (both default to remain:0 / no
@@ -472,19 +625,42 @@
     }
   }
 
+  // How long a fetched warehouse note is trusted before a reload will
+  // fetch it again - long enough that a job's Prep/Check-out screen
+  // being reloaded repeatedly through a shift doesn't re-fetch the
+  // job's entire page (see fetchWarehouseNote) each time, short enough
+  // that a note edited mid-shift shows up for the next natural reload
+  // soon after, without needing its own cache-busting UI.
+  var WAREHOUSE_NOTES_PERSIST_MAX_AGE_MS = 10 * 60 * 1000; // 10 minutes
+
   // Fetches the warehouse note text for a job id, using the browser's
   // existing session cookie (same-origin request - no API token
   // needed, same way the scanning screen's own get_*.php calls work).
+  // Checks the persisted cache first - this fetch pulls the job's
+  // ENTIRE page just to read one custom field out of it (no dedicated
+  // JSON endpoint exists for this field), so it's one of the heavier
+  // requests this plugin makes, and on a job-level scan screen it
+  // used to re-run on every single reload.
   function fetchWarehouseNote(jobId) {
+    var persisted = persistGet('warehouse_note', String(jobId), WAREHOUSE_NOTES_PERSIST_MAX_AGE_MS);
+    if (persisted !== undefined) return Promise.resolve(persisted);
     return fetch('/job.php?id=' + encodeURIComponent(jobId), { credentials: 'same-origin' })
-      .then(function (res) { return res.text(); })
+      .then(function (res) {
+        if (!res.ok) throw new Error('HTTP ' + res.status);
+        return res.text();
+      })
       .then(function (html) {
         var jobData = extractJobData(html);
         var field = jobData && jobData.CUSTOM_FIELDS && jobData.CUSTOM_FIELDS[WAREHOUSE_NOTES_FIELD];
-        return (field && field.value) ? String(field.value) : '';
+        var note = (field && field.value) ? String(field.value) : '';
+        persistSet('warehouse_note', String(jobId), note);
+        return note;
       })
       .catch(function (e) {
         console.warn('[scanning-tree-view plugin] could not load warehouse notes', e);
+        // Deliberately not persisted - a transient failure (e.g. a
+        // rate-limit block) should just be retried on the next
+        // reload/poll, not remembered as "no note" for 10 minutes.
         return '';
       });
   }
@@ -615,15 +791,23 @@
     });
   }
 
-  // If the mobile banner is the one currently showing, it's sitting
-  // above left_pane/grid_pane as an extra row, so both need to shrink
-  // by its height or the bottom of the grid runs past the visible
-  // area (HireHop sizes both with fixed pixel heights, so this has to
-  // be done explicitly - CSS grid alone won't reflow that for us).
-  function shrinkForMobileBanner(instance) {
+  // Any full-width row we've inserted above the left_pane/grid_pane row
+  // (the mobile notes banner, and now the always-visible Prep Progress
+  // bar) is sitting there as extra height HireHop's own fixed-pixel
+  // left_pane/grid_pane sizing knows nothing about, so both need to
+  // shrink by the total of whichever of these rows are actually visible
+  // right now, or the bottom of the grid runs past the visible area
+  // (CSS grid alone won't reflow that for us here).
+  function shrinkForExtraRows(instance) {
+    var extra = 0;
     var banner = instance.__wh_notes_banner;
-    if (!banner || !banner.length || !banner.is(':visible')) return;
-    var extra = banner.outerHeight(true) || 0;
+    if (banner && banner.length && banner.is(':visible')) {
+      extra += (banner.outerHeight(true) || 0);
+    }
+    var progressBar = instance.__wh_prep_progress_bar;
+    if (progressBar && progressBar.length && progressBar.is(':visible')) {
+      extra += (progressBar.outerHeight(true) || 0);
+    }
     if (!extra) return;
     var newHeight = Math.max(instance.left_pane.height() - extra, 200);
     instance.left_pane.height(newHeight);
@@ -631,13 +815,13 @@
   }
 
   // Runs after every resize_left_pane call (HireHop's own, which
-  // always resets left_pane's height to the full - notes-unaware -
-  // value first). Order matters: shrink left_pane's outer height for
-  // the mobile banner first, then recompute the accordion from
-  // whatever's left, so the two adjustments compose correctly however
-  // both are visible.
+  // always resets left_pane's height to the full - notes/progress-bar-
+  // unaware - value first). Order matters: shrink left_pane's outer
+  // height for the extra rows above it first, then recompute the
+  // accordion from whatever's left, so the adjustments compose
+  // correctly however many of these extra rows are visible at once.
   function adjustLeftPaneLayout(instance) {
-    shrinkForMobileBanner(instance);
+    shrinkForExtraRows(instance);
     recomputeAccordionHeight(instance);
   }
 
@@ -672,6 +856,135 @@
     });
   }
 
+  // --- Prep Progress bar ---
+  // (see header comment for the full design/rationale)
+
+  var PREP_PROGRESS_KIND = 1; // always Prep job, regardless of the screen's own kind
+  var PREP_PROGRESS_POLL_INTERVAL_MS = 45000;
+
+  // Sums ordered/scanned across every non-heading/comment row of a
+  // get_prep_list.php response, clamping each line's scanned count to
+  // its own ordered count first so one over-scanned item can't push the
+  // overall percentage past 100%. Returns null when there's nothing on
+  // the Prep job pass at all (ordered totals to 0) - the caller treats
+  // that the same as "no data", hiding the bar rather than showing an
+  // empty/zero one.
+  function computePrepProgressFromRows(rows) {
+    var ordered = 0, scanned = 0;
+    (rows || []).forEach(function (r) {
+      if (!r || r.TYPE === HEADING_TYPE || r.TYPE === COMMENT_TYPE) return;
+      if (typeof r.ordered !== 'number') return;
+      var ord = r.ordered || 0;
+      var scn = typeof r.scanned === 'number' ? r.scanned : 0;
+      ordered += ord;
+      scanned += Math.min(scn, ord);
+    });
+    if (ordered <= 0) return null;
+    return { ordered: ordered, scanned: scanned, pct: Math.round((100 * scanned) / ordered) };
+  }
+
+  // Always fetches the Prep job (kind 1) pass for the given job, no
+  // matter what kind the screen itself currently has open - this is a
+  // standalone request, independent of the screen's own loaded grid
+  // data, same endpoint confirmed live via the Warehouse board plugin.
+  function fetchPrepProgress(jobId) {
+    var url = '/modules/scanning/get_prep_list.php?main_id=' +
+      encodeURIComponent(jobId) + '&kind=' + PREP_PROGRESS_KIND;
+    return fetch(url, { credentials: 'same-origin' })
+      .then(function (res) { return res.json(); })
+      .then(function (resp) { return computePrepProgressFromRows(resp && resp.rows); })
+      .catch(function (e) {
+        console.warn('[scanning-tree-view plugin] could not load Prep job progress', e);
+        return null;
+      });
+  }
+
+  // Builds the bar once per instance: a full-width row above
+  // left_pane/grid_pane (inserted the same way as the mobile notes
+  // banner - see ensureNotesBanner), created BEFORE that banner/panel
+  // on first load so it ends up topmost regardless of screen width.
+  // Starts hidden, same "nothing to show yet" convention as the notes
+  // panel/banner.
+  function ensurePrepProgressBar(instance) {
+    if (instance.__wh_prep_progress_bar) return instance.__wh_prep_progress_bar;
+    if (!instance.left_pane) return null;
+    var bar = $('<div>', { class: 'wh_prep_progress_bar' })
+      .css({
+        display: 'none',
+        gridColumn: '1 / -1',
+        minWidth: 0,
+        width: '80%',
+        margin: '0 auto 6px auto',
+        boxSizing: 'border-box'
+      })
+      .insertBefore(instance.left_pane);
+    var head = $('<div>', {
+      style: 'display:flex; justify-content:space-between; align-items:baseline;' +
+        'font-size:12px; margin-bottom:3px;'
+    }).appendTo(bar);
+    $('<span>', { text: 'Prep Progress', style: 'font-weight:bold; color:#555;' }).appendTo(head);
+    var text = $('<span>', { class: 'wh_prep_progress_text', style: 'color:#555;' }).appendTo(head);
+    var track = $('<div>', {
+      style: 'height:6px; border-radius:3px; background:#e4e4e4; overflow:hidden;'
+    }).appendTo(bar);
+    var fill = $('<div>', {
+      class: 'wh_prep_progress_fill',
+      style: 'height:100%; width:0%; border-radius:3px; background:#4a90d9;' +
+        'transition:width .3s ease, background .3s ease;'
+    }).appendTo(track);
+    instance.__wh_prep_progress_bar = bar;
+    instance.__wh_prep_progress_fill = fill;
+    instance.__wh_prep_progress_text = text;
+    return bar;
+  }
+
+  // Shows/hides/updates the bar for a fetch result (or null - hides it).
+  // Separate from applyPrepProgress/refreshPrepProgress below so both
+  // the initial load and the periodic refresh render through one place.
+  function updatePrepProgressDisplay(instance, result) {
+    var bar = ensurePrepProgressBar(instance);
+    if (!bar) return;
+    if (!result) {
+      bar.hide();
+    } else {
+      instance.__wh_prep_progress_fill.css({
+        width: result.pct + '%',
+        background: result.pct >= 100 ? '#4caf50' : '#4a90d9'
+      });
+      instance.__wh_prep_progress_text.text(result.scanned + ' / ' + result.ordered + ' (' + result.pct + '%)');
+      bar.show();
+    }
+    if (instance.resize_left_pane) instance.resize_left_pane();
+  }
+
+  // Loads Prep Progress for whatever job is currently on screen. Skips
+  // the fetch if we already loaded this job (tracked via
+  // __wh_prep_progress_main_id - the periodic poll is what keeps an
+  // already-loaded job's bar fresh from here), and bails out cleanly if
+  // the user has switched jobs again before a slow fetch comes back.
+  function applyPrepProgress(instance, mainId) {
+    if (!instance.left_pane) return;
+    if (instance.__wh_prep_progress_main_id === mainId && instance.__wh_prep_progress_bar) return;
+    instance.__wh_prep_progress_main_id = mainId;
+    fetchPrepProgress(mainId).then(function (result) {
+      if (instance.__wh_prep_progress_main_id !== mainId) return; // job changed again meanwhile
+      updatePrepProgressDisplay(instance, result);
+    });
+  }
+
+  // Re-fetches and updates the bar for whatever job is already loaded,
+  // without the "already loaded this job" short-circuit above - used by
+  // the periodic poll, and right after a scan made on this screen while
+  // it's open on the Prep job kind itself.
+  function refreshPrepProgress(instance) {
+    var mainId = instance.__wh_prep_progress_main_id;
+    if (!mainId) return;
+    fetchPrepProgress(mainId).then(function (result) {
+      if (instance.__wh_prep_progress_main_id !== mainId) return; // job changed meanwhile
+      updatePrepProgressDisplay(instance, result);
+    });
+  }
+
   // --- Inline notes: stock item memo / item memo / item note ---
   // (see header comment for the full design/rationale)
 
@@ -689,18 +1002,102 @@
     'display:block; flex-basis:100%; width:100%; box-sizing:border-box; white-space:normal;' +
     'word-break:break-word; margin-top:1px; font-size:0.78em; color:#777; font-style:italic;';
 
-  var STOCK_MEMO_MAX_CONCURRENT = 3;
+  // Gentle, on purpose: this plugin runs on low-powered handheld
+  // Android scanners as well as desktop browsers, and a big job can
+  // have 100+ distinct items each needing their own request (no bulk
+  // endpoint exists). The concurrency cap alone used to be the only
+  // throttle here, but these requests resolve almost instantly (small
+  // JSON, same server) - without a minimum gap between dispatches too,
+  // "3 at a time" collapses into a near-continuous burst that's
+  // indistinguishable, from CloudFront's edge in front of
+  // myhirehop.com, from firing them all at once. Confirmed live: that
+  // burst is what was tripping its rate-based blocking on big jobs'
+  // Prep/Check-out screens (requests partway through the burst coming
+  // back 403, with knock-on 403s on other requests/tabs for about a
+  // minute after) - see STOCK_MEMO_STAGGER_MS and
+  // dispatchStockMemoQueue below for the actual fix.
+  var STOCK_MEMO_MAX_CONCURRENT = 2;
+  var STOCK_MEMO_STAGGER_MS = 200; // minimum gap between two dispatches starting, even with a free concurrency slot
+  var STOCK_MEMO_RETRY_COOLDOWN_MS = 15000; // after a failed fetch, don't ask again for this item until this long has passed
+  // Stock item memos live on the equipment's catalogue record, not the
+  // job, so they're shared across every job that uses that item and
+  // rarely change - a long persisted TTL is safe and saves the most.
+  var STOCK_MEMO_PERSIST_MAX_AGE_MS = 6 * 60 * 60 * 1000; // 6 hours
+
   // Keyed by "<LIST_ID>:<TYPE>" - the same two values get_item_info.php
-  // itself is keyed on. Value is the memo string once known ('' if the
-  // item genuinely has none, so we don't ask again), or `true` while a
-  // fetch for it is already in flight.
+  // itself is keyed on (deliberately not scoped to a job id - this is
+  // a catalogue-level memo, the same for every job that uses that
+  // item). Value is the memo string once known ('' if the item
+  // genuinely has none, so we don't ask again), or `true` while a
+  // fetch for it is in flight OR queued. Seeded lazily from the
+  // persisted cache (see getKnownStockMemo) rather than all at once on
+  // load, since most pages only ever look up a fraction of the items
+  // that have ever been cached.
   var stockMemoCache = {};
   var stockMemoInFlight = 0;
+  var stockMemoQueue = []; // {instance, rowData, key} waiting their turn - see requestStockMemo
+  var stockMemoLastDispatch = 0;
+  var stockMemoFailedAt = {}; // key -> Date.now() of its last failure, for the retry cooldown
+  var stockMemoDispatchTimer = null;
 
-  function fetchStockMemo(instance, rowData) {
+  // Looks up whether we already know this item's memo - checking the
+  // in-memory cache first, then falling back to (and seeding from) the
+  // persisted one - WITHOUT queuing a fetch if we don't. Returns
+  // undefined if genuinely unknown, `true` if a fetch is in
+  // flight/queued, or the memo string (possibly '') once known.
+  function getKnownStockMemo(key) {
+    if (stockMemoCache.hasOwnProperty(key)) return stockMemoCache[key];
+    var persisted = persistGet('stock_memo', key, STOCK_MEMO_PERSIST_MAX_AGE_MS);
+    if (persisted !== undefined) {
+      stockMemoCache[key] = persisted;
+      return persisted;
+    }
+    return undefined;
+  }
+
+  // Queues a stock-memo fetch for this item unless it's already known,
+  // in flight, queued, or still cooling down after a recent failure.
+  // Queuing rather than fetching immediately (as this used to) is what
+  // lets dispatchStockMemoQueue actually throttle the rate requests
+  // leave the browser at, rather than just how many are open at once.
+  function requestStockMemo(instance, rowData) {
     var key = rowData.LIST_ID + ':' + rowData.TYPE;
-    if (stockMemoCache.hasOwnProperty(key)) return; // already known, or already in flight
+    if (getKnownStockMemo(key) !== undefined) return;
+    var failedAt = stockMemoFailedAt[key];
+    if (failedAt && (Date.now() - failedAt) < STOCK_MEMO_RETRY_COOLDOWN_MS) return;
     stockMemoCache[key] = true;
+    stockMemoQueue.push({ instance: instance, rowData: rowData, key: key });
+    dispatchStockMemoQueue();
+  }
+
+  // Drains stockMemoQueue at a throttled rate: at most
+  // STOCK_MEMO_MAX_CONCURRENT requests in flight at once, AND at least
+  // STOCK_MEMO_STAGGER_MS between any two requests actually starting -
+  // see the header note on STOCK_MEMO_MAX_CONCURRENT above for why the
+  // concurrency cap alone isn't enough on its own.
+  function dispatchStockMemoQueue() {
+    if (stockMemoDispatchTimer) return;
+    var tick = function () {
+      stockMemoDispatchTimer = null;
+      if (!stockMemoQueue.length) return;
+      if (stockMemoInFlight >= STOCK_MEMO_MAX_CONCURRENT) {
+        stockMemoDispatchTimer = setTimeout(tick, STOCK_MEMO_STAGGER_MS);
+        return;
+      }
+      var wait = STOCK_MEMO_STAGGER_MS - (Date.now() - stockMemoLastDispatch);
+      if (wait > 0) {
+        stockMemoDispatchTimer = setTimeout(tick, wait);
+        return;
+      }
+      stockMemoLastDispatch = Date.now();
+      var job = stockMemoQueue.shift();
+      fetchStockMemo(job.instance, job.rowData, job.key);
+      if (stockMemoQueue.length) stockMemoDispatchTimer = setTimeout(tick, STOCK_MEMO_STAGGER_MS);
+    };
+    tick();
+  }
+
+  function fetchStockMemo(instance, rowData, key) {
     stockMemoInFlight++;
     var url = '/modules/scanning/get_item_info.php' +
       '?job_id=' + encodeURIComponent(rowData.JOB_ID) +
@@ -709,13 +1106,27 @@
       '&list_id=' + encodeURIComponent(rowData.LIST_ID) +
       '&type=' + encodeURIComponent(rowData.TYPE);
     fetch(url, { credentials: 'same-origin' })
-      .then(function (res) { return res.json(); })
+      .then(function (res) {
+        if (!res.ok) throw new Error('HTTP ' + res.status); // e.g. the 403 a rate-limit block returns
+        return res.json();
+      })
       .then(function (info) {
-        stockMemoCache[key] = (info && info.memo) ? String(info.memo) : '';
+        var memo = (info && info.memo) ? String(info.memo) : '';
+        stockMemoCache[key] = memo;
+        delete stockMemoFailedAt[key];
+        persistSet('stock_memo', key, memo);
       })
       .catch(function (e) {
         console.warn('[scanning-tree-view plugin] could not load stock item memo', e);
-        stockMemoCache[key] = ''; // don't retry endlessly on a persistent error
+        // Don't cache a failure as "no memo" - that used to mean a
+        // single transient error (a network blip, or exactly this
+        // kind of rate-limit block) permanently blanked out an item's
+        // reminder for the rest of the page's life, with no retry.
+        // Drop the in-flight marker so it's eligible to be asked for
+        // again, after a short cooldown so a genuinely persistent
+        // error doesn't just retry in a tight loop.
+        delete stockMemoCache[key];
+        stockMemoFailedAt[key] = Date.now();
       })
       .then(function () {
         stockMemoInFlight--;
@@ -723,6 +1134,7 @@
         // re-rendered - ask for a refresh once this batch of fetches
         // has settled (debounced below).
         scheduleGridRefresh(instance);
+        if (stockMemoQueue.length) dispatchStockMemoQueue();
       });
   }
 
@@ -849,9 +1261,9 @@
     container.style.flexWrap = 'wrap';
 
     var key = rowData.LIST_ID + ':' + rowData.TYPE;
-    var stockMemo = stockMemoCache[key];
+    var stockMemo = getKnownStockMemo(key);
     if (stockMemo === undefined) {
-      if (stockMemoInFlight < STOCK_MEMO_MAX_CONCURRENT) fetchStockMemo(instance, rowData);
+      requestStockMemo(instance, rowData);
     } else if (stockMemo && stockMemo !== true) {
       $('<span>', {
         'class': 'wh_stock_memo_inline',
@@ -926,6 +1338,10 @@
       var result = origInitialDataLoaded.apply(this, arguments);
       defaultToTreeIfApplicable(this);
       applyTreeHideCompleted(this);
+      // Prep Progress is built/inserted before the Warehouse Notes
+      // panel/banner so it ends up topmost in the DOM (see
+      // ensurePrepProgressBar) - order matters here.
+      applyPrepProgress(this, this.options.main_id);
       applyWarehouseNote(this, this.options.kind, this.options.main_id);
       return result;
     };
@@ -941,6 +1357,12 @@
     instance.apply_data_changes = function (data_changes) {
       var result = origApplyDataChanges.apply(this, arguments);
       applyTreeHideCompleted(this);
+      // A scan made while this screen itself is open on the Prep job
+      // kind directly changes what Prep Progress measures - refresh
+      // right away rather than waiting for the next poll. Scans on any
+      // other kind don't affect it, so leave those to the poll below
+      // (keeps this cheap - no extra request on every ordinary scan).
+      if (this.options.kind === PREP_PROGRESS_KIND) refreshPrepProgress(this);
       return result;
     };
 
@@ -975,6 +1397,7 @@
     // state the screen is already in.
     defaultToTreeIfApplicable(instance);
     applyTreeHideCompleted(instance);
+    applyPrepProgress(instance, instance.options.main_id);
     applyWarehouseNote(instance, instance.options.kind, instance.options.main_id);
 
     // Safety net: some updates (deleting/undoing a scan, another
@@ -985,6 +1408,15 @@
     setInterval(function () {
       applyTreeHideCompleted(instance);
     }, SYNC_POLL_INTERVAL_MS);
+
+    // Prep Progress isn't necessarily affected by anything that happens
+    // on THIS screen (another terminal could be doing the actual
+    // prepping while this one sits open on a different kind), so poll
+    // independently rather than relying only on the apply_data_changes
+    // hook above.
+    setInterval(function () {
+      refreshPrepProgress(instance);
+    }, PREP_PROGRESS_POLL_INTERVAL_MS);
   }
 
   function findAndPatch() {
