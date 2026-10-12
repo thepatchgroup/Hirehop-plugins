@@ -1072,11 +1072,28 @@
   //     with no gap, which risks tripping CloudFront's separate,
   //     cruder burst-rate WAF rule (NOT the same thing as the
   //     documented account limit above - see the Gotchas section) -
-  //     guarded by CATALOGUE_REFRESH_PAGE_STAGGER_MS.
+  //     guarded by CATALOGUE_REFRESH_PAGE_STAGGER_MS;
+  //   - the burst landing right at page load, competing with the page's
+  //     OWN startup traffic for the browser's connection pool at the
+  //     exact moment HireHop's native real-time multi-user sync
+  //     connection is also trying to establish itself - confirmed live
+  //     12 October 2026 (a "Can't connect to multi user sync" error
+  //     appeared right after this catalogue refresh first went live,
+  //     and reproduced on a plain reload) - guarded by
+  //     CATALOGUE_REFRESH_INITIAL_DELAY_MS, which lets the page's own
+  //     startup settle before this refresh fires a single request.
   var PREP_REMINDER_FIELD = 'prep_reminder';
   var CATALOGUE_LIST_URL = '/modules/stock/list.php';
   var CATALOGUE_PAGE_ROWS = 100;
-  var CATALOGUE_REFRESH_PAGE_STAGGER_MS = 600;
+  // Raised from 600ms (12 October 2026, same day as the deploy that
+  // introduced it) after the faster pacing coincided with native
+  // real-time sync connection failures - see header comment above.
+  var CATALOGUE_REFRESH_PAGE_STAGGER_MS = 2000;
+  // How long to wait after a refresh is first found to be due before
+  // actually starting it - gives the page's own startup traffic (and
+  // the real-time sync handshake) priority. Added 12 October 2026 - see
+  // header comment above.
+  var CATALOGUE_REFRESH_INITIAL_DELAY_MS = 5000;
   // Catalogue-level data, rarely changes minute to minute - same
   // reasoning as the old per-item TTL it replaces.
   var CATALOGUE_REFRESH_MAX_AGE_MS = 6 * 60 * 60 * 1000; // 6 hours
@@ -1225,21 +1242,26 @@
     if (now - (meta.refreshedAt || 0) < CATALOGUE_REFRESH_MAX_AGE_MS) return; // fresh enough
     if (meta.failedAt && (now - meta.failedAt) < CATALOGUE_REFRESH_FAILURE_COOLDOWN_MS) return; // recently failed - back off
 
-    if (window.navigator && navigator.locks && navigator.locks.request) {
-      navigator.locks.request(CATALOGUE_REFRESH_LOCK_NAME, { ifAvailable: true }, function (lock) {
-        if (!lock) return; // another tab on this device already has this - just use whatever's cached
-        return doCatalogueRefresh(instance);
-      }).catch(function () {
-        // Lock request itself failed (e.g. the API exists but threw) -
-        // degrade to doing it directly rather than never refreshing.
+    // Don't fire the first request immediately - let the page's own
+    // startup traffic (and HireHop's real-time sync handshake) go
+    // first. See CATALOGUE_REFRESH_INITIAL_DELAY_MS above.
+    setTimeout(function () {
+      if (window.navigator && navigator.locks && navigator.locks.request) {
+        navigator.locks.request(CATALOGUE_REFRESH_LOCK_NAME, { ifAvailable: true }, function (lock) {
+          if (!lock) return; // another tab on this device already has this - just use whatever's cached
+          return doCatalogueRefresh(instance);
+        }).catch(function () {
+          // Lock request itself failed (e.g. the API exists but threw) -
+          // degrade to doing it directly rather than never refreshing.
+          doCatalogueRefresh(instance);
+        });
+      } else {
+        // No Web Locks API (older Safari, some embedded/kiosk webviews) -
+        // each tab paces/coordinates only with itself, same fallback
+        // philosophy as the old per-item dispatch used.
         doCatalogueRefresh(instance);
-      });
-    } else {
-      // No Web Locks API (older Safari, some embedded/kiosk webviews) -
-      // each tab paces/coordinates only with itself, same fallback
-      // philosophy as the old per-item dispatch used.
-      doCatalogueRefresh(instance);
-    }
+      }
+    }, CATALOGUE_REFRESH_INITIAL_DELAY_MS);
   }
 
   // pqGrid lays out rows at a single configured height (option `rowHt`)
