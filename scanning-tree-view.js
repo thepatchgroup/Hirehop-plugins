@@ -376,9 +376,17 @@
   //         render_title_cell - it special-cases TYPE 100).
   var HEADING_TYPE = 5;
   var COMMENT_TYPE = 100;
+  // 0 = category/sub-group container row in the Tree (e.g. "Wireless",
+  //     "IEMS", "Cable" - a true parent node with a `children` array,
+  //     distinct from the flat TYPE-5 heading marker above). Confirmed
+  //     live (12 October 2026): always carries LIST_ID 0 and empty
+  //     MEMO/ADDITIONAL - it's a structural grouping, not a real stock
+  //     item or job line, so it never has real notes of its own.
+  var CATEGORY_TYPE = 0;
 
   function isHeadingNode(node) { return node.TYPE === HEADING_TYPE; }
   function isCommentNode(node) { return node.TYPE === COMMENT_TYPE; }
+  function isCategoryNode(node) { return node.TYPE === CATEGORY_TYPE; }
 
   // A node counts as "fully scanned" if it has no children and its
   // own remaining count is 0 or less, OR - if it does have children
@@ -1328,7 +1336,14 @@
   // never ends up duplicating pills) on every refresh.
   function appendInlineNotes(instance, ui) {
     var rowData = ui.rowData;
-    if (!rowData || rowData.TYPE === HEADING_TYPE || rowData.TYPE === COMMENT_TYPE) return;
+    // Category container rows (TYPE 0, e.g. "Wireless"/"IEMS") always
+    // carry LIST_ID 0 and have no real notes of their own (confirmed
+    // live) - without this, every one of them queued a stock-memo fetch
+    // for the degenerate "0:0" key, which permanently returns
+    // {"error":3} (not a transient flake) and got retried forever on
+    // the usual 15s cooldown, burning a slice of the rate-limit budget
+    // on a request that could never succeed.
+    if (!rowData || isHeadingNode(rowData) || isCommentNode(rowData) || isCategoryNode(rowData)) return;
     var cellEl = ui.cell && ui.cell.jquery ? ui.cell[0] : ui.cell;
     if (!cellEl) return;
 
